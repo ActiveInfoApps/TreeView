@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using DiskSpaceTree.Models;
 
 namespace DiskSpaceTree.Services;
@@ -108,10 +109,35 @@ public sealed class DiskSpaceScanner
                     node.Children.Add(childNode);
                 }
 
+                long childSizeAtStart = 0;
+                PropertyChangedEventHandler? childSizeChanged = null;
+
+                if (AddDirectoriesBeforeScan)
+                {
+                    childSizeChanged = (s, e) =>
+                    {
+                        if (e.PropertyName == nameof(FileSystemNode.SizeInKb))
+                        {
+                            var delta = (childNode.SizeInKb - childSizeAtStart) * 1024;
+                            sizeInBytes += delta;
+                            childSizeAtStart = childNode.SizeInKb;
+                            node.SizeInKb = ConvertToKilobytes(sizeInBytes);
+                        }
+                    };
+                    childNode.PropertyChanged += childSizeChanged;
+                }
+
                 await ScanDirectoryRecursiveAsync(childNode, progress, cancellationToken);
 
-                sizeInBytes += childNode.SizeInKb * 1024;
-                node.SizeInKb = ConvertToKilobytes(sizeInBytes);
+                if (childSizeChanged != null)
+                {
+                    childNode.PropertyChanged -= childSizeChanged;
+                }
+                else
+                {
+                    sizeInBytes += childNode.SizeInKb * 1024;
+                    node.SizeInKb = ConvertToKilobytes(sizeInBytes);
+                }
 
                 if (AddDirectoriesBeforeScan)
                 {
