@@ -10,6 +10,7 @@ public sealed class FileSystemNode : INotifyPropertyChanged
     private bool _isExpanded;
     private bool _hasError;
     private string? _errorMessage;
+    public readonly object SyncRoot = new();
 
     public FileSystemNode(string name, string path, bool isDirectory)
     {
@@ -61,21 +62,24 @@ public sealed class FileSystemNode : INotifyPropertyChanged
 
     private bool SetProperty<T>(ref T field, T value, [CallerMemberName] string propertyName = "")
     {
-        if (EqualityComparer<T>.Default.Equals(field, value))
+        lock (SyncRoot)
         {
-            return false;
+            if (EqualityComparer<T>.Default.Equals(field, value))
+            {
+                return false;
+            }
+
+            field = value;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+
+            // Derived/calculated display properties also need to refresh when size changes.
+            if (propertyName == nameof(SizeInKb))
+            {
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(DisplaySize)));
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(DisplayText)));
+            }
+
+            return true;
         }
-
-        field = value;
-        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
-
-        // Derived/calculated display properties also need to refresh when size changes.
-        if (propertyName == nameof(SizeInKb))
-        {
-            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(DisplaySize)));
-            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(DisplayText)));
-        }
-
-        return true;
     }
 }

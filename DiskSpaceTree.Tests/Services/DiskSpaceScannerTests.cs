@@ -195,4 +195,36 @@ public class DiskSpaceScannerTests
         // Parent still includes child's size (0 in this case) plus its own file
         Assert.Equal(1, result.SizeInKb);
     }
+
+    [Fact]
+    public async Task ScanDirectoryAsync_HeavyChildDirectory_IsScannedAndIncludedInTotal()
+    {
+        var fs = new InMemoryFileSystemAccessor();
+        fs.AddFile(@"C:\root", "root.txt", 1024);
+        fs.AddChildDirectory(@"C:\root", "heavy");
+        for (var i = 0; i < 201; i++)
+        {
+            fs.AddFile(@"C:\root\heavy", $"file{i}.txt", 1024);
+        }
+        fs.AddChildDirectory(@"C:\root", "light");
+        fs.AddFile(@"C:\root\light", "file.txt", 2048);
+
+        var scanner = new DiskSpaceScanner(fs);
+        var result = CreateNode(@"C:\root");
+
+        await scanner.ScanDirectoryAsync(result);
+
+        // root: 1024 -> 1 KB
+        // heavy: 201 * 1024 = 205824 bytes -> 201 KB
+        // light: 2048 -> 2 KB
+        // total: 1024 + 205824 + 2048 = 208896 bytes -> 204 KB
+        Assert.Equal(204, result.SizeInKb);
+        Assert.Equal(2, result.Children.Count);
+        var heavy = result.Children.FirstOrDefault(c => c.Name == "heavy");
+        Assert.NotNull(heavy);
+        Assert.Equal(201, heavy.SizeInKb);
+        var light = result.Children.FirstOrDefault(c => c.Name == "light");
+        Assert.NotNull(light);
+        Assert.Equal(2, light.SizeInKb);
+    }
 }

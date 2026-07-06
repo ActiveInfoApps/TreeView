@@ -62,6 +62,7 @@ public sealed class DiskSpaceScanner
         Thread.Sleep(100);
 
         long sizeInBytes = 0;
+        var spawnedTasks = new List<Task>();
 
         try
         {
@@ -106,45 +107,95 @@ public sealed class DiskSpaceScanner
 
                 if (AddDirectoriesBeforeScan)
                 {
-                    node.Children.Add(childNode);
-                }
-
-                long childSizeAtStart = 0;
-                PropertyChangedEventHandler? childSizeChanged = null;
-
-                if (AddDirectoriesBeforeScan)
-                {
-                    childSizeChanged = (s, e) =>
+                    lock (node.SyncRoot)
                     {
-                        if (e.PropertyName == nameof(FileSystemNode.SizeInKb))
-                        {
-                            var delta = (childNode.SizeInKb - childSizeAtStart) * 1024;
-                            sizeInBytes += delta;
-                            childSizeAtStart = childNode.SizeInKb;
-                            node.SizeInKb = ConvertToKilobytes(sizeInBytes);
-                        }
-                    };
-                    childNode.PropertyChanged += childSizeChanged;
+                        node.Children.Add(childNode);
+                    }
                 }
 
-                await ScanDirectoryRecursiveAsync(childNode, progress, cancellationToken);
-
-                if (childSizeChanged != null)
+                // Count files in the child directory to decide whether to scan it in a background task.
+                int fileCount = 0;
+                try
                 {
-                    childNode.PropertyChanged -= childSizeChanged;
+                    fileCount = _fileSystemAccessor.EnumerateFiles(directory).Count();
+                }
+                catch (Exception ex) when (ex is UnauthorizedAccessException or FileNotFoundException or PathTooLongException)
+                {
+                    // If we cannot count files, treat it as a non-heavy directory and let the scan handle the error.
+                    fileCount = 0;
+                }
+
+                if (fileCount > 200)
+                {
+                    // Heavy directory: start a background task and continue with the next directory.
+                    var task = Task.Run(async () =>
+                    {
+                        await ScanDirectoryRecursiveAsync(childNode, progress, cancellationToken);
+
+                        lock (node.SyncRoot)
+                        {
+                            sizeInBytes += childNode.SizeInKb * 1024;
+                            node.SizeInKb = ConvertToKilobytes(sizeInBytes);
+
+                            if (AddDirectoriesBeforeScan)
+                            {
+                                node.Children.Remove(childNode);
+                            }
+
+                            InsertChildSorted(node, childNode);
+                        }
+                    }, cancellationToken);
+
+                    spawnedTasks.Add(task);
                 }
                 else
                 {
-                    sizeInBytes += childNode.SizeInKb * 1024;
-                    node.SizeInKb = ConvertToKilobytes(sizeInBytes);
-                }
+                    long childSizeAtStart = 0;
+                    PropertyChangedEventHandler? childSizeChanged = null;
 
-                if (AddDirectoriesBeforeScan)
-                {
-                    node.Children.Remove(childNode);
-                }
+                    if (AddDirectoriesBeforeScan)
+                    {
+                        childSizeChanged = (s, e) =>
+                        {
+                            if (e.PropertyName == nameof(FileSystemNode.SizeInKb))
+                            {
+                                lock (node.SyncRoot)
+                                {
+                                    var delta = (childNode.SizeInKb - childSizeAtStart) * 1024;
+                                    sizeInBytes += delta;
+                                    childSizeAtStart = childNode.SizeInKb;
+                                    node.SizeInKb = ConvertToKilobytes(sizeInBytes);
+                                }
+                            }
+                        };
+                        childNode.PropertyChanged += childSizeChanged;
+                    }
 
-                InsertChildSorted(node, childNode);
+                    await ScanDirectoryRecursiveAsync(childNode, progress, cancellationToken);
+
+                    if (childSizeChanged != null)
+                    {
+                        childNode.PropertyChanged -= childSizeChanged;
+                    }
+                    else
+                    {
+                        lock (node.SyncRoot)
+                        {
+                            sizeInBytes += childNode.SizeInKb * 1024;
+                            node.SizeInKb = ConvertToKilobytes(sizeInBytes);
+                        }
+                    }
+
+                    lock (node.SyncRoot)
+                    {
+                        if (AddDirectoriesBeforeScan)
+                        {
+                            node.Children.Remove(childNode);
+                        }
+
+                        InsertChildSorted(node, childNode);
+                    }
+                }
 
                 await Task.Yield();
             }
@@ -154,6 +205,8 @@ public sealed class DiskSpaceScanner
             node.HasError = true;
             node.ErrorMessage = ex.Message;
         }
+
+        await Task.WhenAll(spawnedTasks);
 
         node.SizeInKb = ConvertToKilobytes(sizeInBytes);
     }
