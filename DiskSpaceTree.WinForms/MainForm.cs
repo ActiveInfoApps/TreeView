@@ -25,7 +25,10 @@ public partial class MainForm : Form
 
     public MainForm()
     {
-        _scanner = new DiskSpaceScanner(new FileSystemAccessor());
+        _scanner = new DiskSpaceScanner(new FileSystemAccessor())
+        {
+            AddDirectoriesBeforeScan = true
+        };
 
         Text = "Disk Space Tree";
         Size = new Size(900, 600);
@@ -365,13 +368,35 @@ public partial class MainForm : Form
                     var index = e.NewStartingIndex >= 0 ? e.NewStartingIndex : parentTreeNode.Nodes.Count;
                     foreach (FileSystemNode child in e.NewItems)
                     {
-                        var childTreeNode = CreateTreeNode(child);
+                        TreeNode childTreeNode;
+                        if (_nodeMap.TryGetValue(child, out var existingNode))
+                        {
+                            childTreeNode = existingNode;
+                        }
+                        else
+                        {
+                            childTreeNode = CreateTreeNode(child);
+                            SubscribeToNode(child, childTreeNode);
+                        }
+
                         parentTreeNode.Nodes.Insert(index, childTreeNode);
-                        SubscribeToNode(child, childTreeNode);
                         index++;
                     }
 
                     UpdateTreeNode(parentTreeNode, parentNode);
+                }
+                break;
+
+            case NotifyCollectionChangedAction.Remove:
+                if (e.OldItems != null)
+                {
+                    foreach (FileSystemNode child in e.OldItems)
+                    {
+                        if (_nodeMap.TryGetValue(child, out var childTreeNode))
+                        {
+                            parentTreeNode.Nodes.Remove(childTreeNode);
+                        }
+                    }
                 }
                 break;
 

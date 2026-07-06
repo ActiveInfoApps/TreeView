@@ -12,6 +12,12 @@ public sealed class DiskSpaceScanner
         _fileSystemAccessor = fileSystemAccessor ?? throw new ArgumentNullException(nameof(fileSystemAccessor));
     }
 
+    /// <summary>
+    /// When true, each child directory is added to its parent before it is scanned
+    /// and moved to the correct sorted position after the scan completes.
+    /// </summary>
+    public bool AddDirectoriesBeforeScan { get; set; }
+
     public static IEnumerable<FileSystemNode> GetDrives()
     {
         foreach (var drive in DriveInfo.GetDrives())
@@ -96,10 +102,21 @@ public sealed class DiskSpaceScanner
 
                 var childName = System.IO.Path.GetFileName(directory);
                 var childNode = new FileSystemNode(childName, directory, isDirectory: true);
+
+                if (AddDirectoriesBeforeScan)
+                {
+                    node.Children.Add(childNode);
+                }
+
                 await ScanDirectoryRecursiveAsync(childNode, progress, cancellationToken);
 
                 sizeInBytes += childNode.SizeInKb * 1024;
                 node.SizeInKb = ConvertToKilobytes(sizeInBytes);
+
+                if (AddDirectoriesBeforeScan)
+                {
+                    node.Children.Remove(childNode);
+                }
 
                 InsertChildSorted(node, childNode);
 
