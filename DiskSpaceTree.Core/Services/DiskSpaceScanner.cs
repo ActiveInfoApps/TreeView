@@ -52,6 +52,8 @@ public sealed class DiskSpaceScanner
     {
         cancellationToken.ThrowIfCancellationRequested();
 
+        Thread.Sleep(100);
+
         long sizeInBytes = 0;
 
         try

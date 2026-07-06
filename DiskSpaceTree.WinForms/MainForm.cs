@@ -19,6 +19,9 @@ public partial class MainForm : Form
     private readonly Button _cancelButton;
     private readonly Label _statusLabel;
     private readonly ProgressBar _progressBar;
+    private readonly System.Windows.Forms.Timer _updateTimer;
+    private readonly HashSet<FileSystemNode> _dirtyNodes = [];
+    private readonly Dictionary<FileSystemNode, TreeNode> _nodeMap = [];
 
     public MainForm()
     {
@@ -28,62 +31,71 @@ public partial class MainForm : Form
         Size = new Size(900, 600);
         StartPosition = FormStartPosition.CenterScreen;
 
-        var topPanel = new FlowLayoutPanel
+        var topPanel = new Panel
         {
             Dock = DockStyle.Top,
-            AutoSize = true,
-            Padding = new Padding(5),
-            WrapContents = false
+            Height = 40
         };
 
-        topPanel.Controls.Add(new Label
+        int x = 5;
+        var label = new Label
         {
             Text = "Select a disk drive to scan:",
             AutoSize = true,
-            Margin = new Padding(0, 5, 5, 0)
-        });
+            Location = new Point(x, 10)
+        };
+        topPanel.Controls.Add(label);
+        x += label.PreferredWidth + 10;
 
         _driveComboBox = new ComboBox
         {
             Width = 120,
-            DropDownStyle = ComboBoxStyle.DropDownList
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Location = new Point(x, 6)
         };
         _driveComboBox.SelectedIndexChanged += DriveComboBox_SelectedIndexChanged;
         topPanel.Controls.Add(_driveComboBox);
+        x += 130;
 
         _scanButton = new Button
         {
             Text = "Scan",
-            AutoSize = true,
-            Margin = new Padding(5, 0, 0, 0)
+            Width = 75,
+            Height = 23,
+            Location = new Point(x, 6)
         };
         _scanButton.Click += ScanButton_Click;
         topPanel.Controls.Add(_scanButton);
+        x += 80;
 
         _cancelButton = new Button
         {
             Text = "Cancel",
-            AutoSize = true,
+            Width = 75,
+            Height = 23,
             Enabled = false,
-            Margin = new Padding(5, 0, 0, 0)
+            Location = new Point(x, 6)
         };
         _cancelButton.Click += CancelButton_Click;
         topPanel.Controls.Add(_cancelButton);
+        x += 80;
 
         _progressBar = new ProgressBar
         {
             Style = ProgressBarStyle.Marquee,
             Width = 100,
+            Height = 23,
             Visible = false,
-            Margin = new Padding(5, 0, 0, 0)
+            Location = new Point(x, 6)
         };
         topPanel.Controls.Add(_progressBar);
+        x += 110;
 
         _statusLabel = new Label
         {
             Text = "Select a drive and click Scan.",
             AutoSize = true,
-            Margin = new Padding(5, 5, 0, 0)
+            Location = new Point(x, 10)
         };
         topPanel.Controls.Add(_statusLabel);
 
@@ -115,7 +127,36 @@ public partial class MainForm : Form
         Controls.Add(topPanel);
         Controls.Add(statusStrip);
 
+        _updateTimer = new System.Windows.Forms.Timer { Interval = 100 };
+        _updateTimer.Tick += UpdateTimer_Tick;
+
         LoadDrives();
+    }
+
+    private void UpdateTimer_Tick(object? sender, EventArgs e)
+    {
+        _treeView.BeginUpdate();
+        try
+        {
+            lock (_dirtyNodes)
+            {
+                foreach (var node in _dirtyNodes)
+                {
+                    if (_nodeMap.TryGetValue(node, out var treeNode))
+                    {
+                        UpdateTreeNode(treeNode, node);
+                    }
+                }
+
+                _dirtyNodes.Clear();
+            }
+        }
+        finally
+        {
+            _treeView.EndUpdate();
+        }
+
+        _updateTimer.Stop();
     }
 
     private void LoadDrives()
@@ -160,13 +201,15 @@ public partial class MainForm : Form
 
         var progress = new Progress<ScanStatus>(status =>
         {
-            _statusPathLabel.Text = status.CurrentFilePath;
+            var folderPath = System.IO.Path.GetDirectoryName(status.CurrentFilePath) ?? status.CurrentFilePath;
+            _statusPathLabel.Text = folderPath;
             _statusCountLabel.Text = $"Files: {status.FilesProcessed:N0}";
         });
 
         try
         {
-            await _scanner.ScanDriveAsync(driveNode, progress, _cancellationTokenSource.Token);
+            // Run the scan on a thread-pool thread so the WinForms UI thread stays responsive.
+            await Task.Run(() => _scanner.ScanDriveAsync(driveNode, progress, _cancellationTokenSource.Token), _cancellationTokenSource.Token);
             _statusLabel.Text = $"Scan complete. {driveNode.DisplaySize} total.";
         }
         catch (OperationCanceledException)
@@ -260,6 +303,7 @@ public partial class MainForm : Form
             treeNode.ForeColor = Color.Red;
         }
 
+        _nodeMap[node] = treeNode;
         return treeNode;
     }
 
@@ -277,7 +321,7 @@ public partial class MainForm : Form
             {
                 case nameof(FileSystemNode.SizeInKb):
                 case nameof(FileSystemNode.HasError):
-                    InvokeOnUiThread(() => UpdateTreeNode(treeNode, node));
+                    MarkNodeDirty(node);
                     break;
             }
         };
@@ -295,6 +339,22 @@ public partial class MainForm : Form
         }
     }
 
+    private void MarkNodeDirty(FileSystemNode node)
+    {
+        lock (_dirtyNodes)
+        {
+            _dirtyNodes.Add(node);
+        }
+
+        InvokeOnUiThread(() =>
+        {
+            if (!_updateTimer.Enabled)
+            {
+                _updateTimer.Start();
+            }
+        });
+    }
+
     private void HandleChildrenChanged(TreeNode parentTreeNode, FileSystemNode parentNode, NotifyCollectionChangedEventArgs e)
     {
         switch (e.Action)
@@ -310,6 +370,8 @@ public partial class MainForm : Form
                         SubscribeToNode(child, childTreeNode);
                         index++;
                     }
+
+                    UpdateTreeNode(parentTreeNode, parentNode);
                 }
                 break;
 
@@ -321,6 +383,8 @@ public partial class MainForm : Form
                     parentTreeNode.Nodes.Add(childTreeNode);
                     SubscribeToNode(child, childTreeNode);
                 }
+
+                UpdateTreeNode(parentTreeNode, parentNode);
                 break;
         }
     }
