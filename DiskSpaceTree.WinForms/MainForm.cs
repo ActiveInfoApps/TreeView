@@ -13,6 +13,7 @@ public partial class MainForm : Form
     private bool _isBusy;
     private readonly ToolStripStatusLabel _statusPathLabel;
     private readonly ToolStripStatusLabel _statusCountLabel;
+    private readonly ToolStripStatusLabel _statusDirsLabel;
     private readonly ToolStripStatusLabel _statusTotalSizeLabel;
     private readonly TreeView _treeView;
     private readonly DataGridView _topDirectoriesGrid;
@@ -129,9 +130,11 @@ public partial class MainForm : Form
             TextAlign = ContentAlignment.MiddleLeft
         };
         _statusCountLabel = new ToolStripStatusLabel { Text = "Files: 0" };
+        _statusDirsLabel = new ToolStripStatusLabel { Text = "Dirs: 0" };
         _statusTotalSizeLabel = new ToolStripStatusLabel { Text = "Total: 0 KB" };
         statusStrip.Items.Add(_statusPathLabel);
         statusStrip.Items.Add(_statusCountLabel);
+        statusStrip.Items.Add(_statusDirsLabel);
         statusStrip.Items.Add(_statusTotalSizeLabel);
 
         _topDirectoriesGrid = new DataGridView
@@ -288,6 +291,17 @@ public partial class MainForm : Form
             var folderPath = System.IO.Path.GetDirectoryName(status.CurrentFilePath) ?? status.CurrentFilePath;
             _statusPathLabel.Text = folderPath;
             _statusCountLabel.Text = $"Files: {status.FilesProcessed:N0}";
+
+            if (status.Stage == ScanStage.ListingDirectories)
+            {
+                _statusDirsLabel.Text = $"Dirs found: {status.DirectoriesFound:N0}";
+                _statusLabel.Text = "Scanning directories...";
+            }
+            else
+            {
+                _statusDirsLabel.Text = $"Dirs scanned: {status.DirectoriesScanned:N0} / {status.DirectoriesFound:N0}";
+                _statusLabel.Text = "Scanning files...";
+            }
         });
 
         try
@@ -307,7 +321,7 @@ public partial class MainForm : Form
         finally
         {
             // Even when the scan is stopped early, generate the summary from whatever was scanned so far.
-            PopulateTopDirectories(driveNode);
+            PopulateTopDirectories();
             IsBusy = false;
             _cancellationTokenSource?.Dispose();
             _cancellationTokenSource = null;
@@ -327,13 +341,12 @@ public partial class MainForm : Form
         }
 
         var completed = Interlocked.Increment(ref _directoriesScannedCount);
-        if (completed % 20 != 0)
+        if (completed % 100 != 0)
         {
             return;
         }
 
-        var rootNode = _rootNode;
-        InvokeOnUiThread(() => PopulateTopDirectories(rootNode));
+        InvokeOnUiThread(PopulateTopDirectories);
     }
 
     private bool IsBusy
@@ -473,6 +486,11 @@ public partial class MainForm : Form
 
     private void HandleChildrenChanged(TreeNode parentTreeNode, FileSystemNode parentNode, NotifyCollectionChangedEventArgs e)
     {
+        if (_scanner.CurrentStage == ScanStage.ListingDirectories)
+        {
+            return;
+        }
+
         switch (e.Action)
         {
             case NotifyCollectionChangedAction.Add:
@@ -545,18 +563,10 @@ public partial class MainForm : Form
         }
     }
 
-    private void PopulateTopDirectories(FileSystemNode rootNode)
+    private void PopulateTopDirectories()
     {
-        var directories = new List<FileSystemNode>();
-        CollectDirectories(rootNode, directories);
-
-        // The drive node itself always has the largest total size, so exclude it from the top 20.
-        // Rank directories by the size of their own files only, excluding subdirectories.
-        var top = directories
-            .Where(d => !ReferenceEquals(d, rootNode))
-            .OrderByDescending(d => d.DirectSizeInKb)
-            .Take(20)
-            .ToList();
+        // Rank scanned directories by the size of their own files only, excluding subdirectories.
+        var top = _scanner.GetTopDirectories(20);
 
         var hash = ComputeDirectoryHash(top);
         if (hash == _topDirectoriesHash)
@@ -568,7 +578,7 @@ public partial class MainForm : Form
         _topDirectoriesGrid.DataSource = top;
     }
 
-    private static string ComputeDirectoryHash(List<FileSystemNode> directories)
+    private static string ComputeDirectoryHash(IReadOnlyList<FileSystemNode> directories)
     {
         var builder = new System.Text.StringBuilder();
         foreach (var node in directories)
@@ -583,20 +593,5 @@ public partial class MainForm : Form
         var bytes = System.Text.Encoding.UTF8.GetBytes(builder.ToString());
         var hashBytes = md5.ComputeHash(bytes);
         return Convert.ToHexString(hashBytes);
-    }
-
-    private static void CollectDirectories(FileSystemNode node, List<FileSystemNode> result)
-    {
-        List<FileSystemNode> children;
-        lock (node.SyncRoot)
-        {
-            children = node.Children.ToList();
-        }
-
-        foreach (var child in children)
-        {
-            result.Add(child);
-            CollectDirectories(child, result);
-        }
     }
 }

@@ -284,4 +284,55 @@ public class DiskSpaceScannerTests
         Assert.NotNull(light);
         Assert.Equal(2, light.SizeInKb);
     }
+
+    [Fact]
+    public async Task ScanDirectoryAsync_StopsListingAtDefaultLimit()
+    {
+        var fs = new InMemoryFileSystemAccessor();
+        fs.AddDirectory(@"C:\root");
+        for (var i = 0; i < DiskSpaceScanner.MaxDirectoriesToScan + 100; i++)
+        {
+            fs.AddChildDirectory(@"C:\root", $"dir{i}");
+        }
+
+        var scanner = new DiskSpaceScanner(fs);
+        var result = CreateNode(@"C:\root");
+
+        await scanner.ScanDirectoryAsync(result);
+
+        Assert.Equal(DiskSpaceScanner.MaxDirectoriesToScan, scanner.DirectoriesFound);
+        // The root node fills one slot of the found-directories dictionary.
+        Assert.Equal(DiskSpaceScanner.MaxDirectoriesToScan - 1, result.Children.Count);
+    }
+
+    [Fact]
+    public async Task ScanDirectoryAsync_ReportsDirectoryCountAndCompletionPerDirectory()
+    {
+        var fs = new InMemoryFileSystemAccessor();
+        fs.AddFile(@"C:\root", "root.txt", 1024);
+        fs.AddChildDirectory(@"C:\root", "sub1");
+        fs.AddFile(@"C:\root\sub1", "a.txt", 512);
+        fs.AddChildDirectory(@"C:\root", "sub2");
+        fs.AddChildDirectory(@"C:\root\sub2", "deep");
+        fs.AddFile(@"C:\root\sub2\deep", "b.txt", 1024);
+
+        var scanner = new DiskSpaceScanner(fs);
+        var result = CreateNode(@"C:\root");
+        var completedDirs = new List<string>();
+        scanner.DirectoryCompleted += (s, node) => completedDirs.Add(node.Path);
+        var reports = new List<ScanStatus>();
+        var progress = new Progress<ScanStatus>(reports.Add);
+
+        await scanner.ScanDirectoryAsync(result, progress);
+
+        // Stages: listing first, then file scanning; directory count is reported.
+        Assert.Contains(reports, r => r.Stage == ScanStage.ListingDirectories && r.DirectoriesFound == 4);
+
+        // DirectoryCompleted fires once per directory: root, sub1, sub2, deep.
+        Assert.Equal(4, completedDirs.Count);
+        Assert.Contains(@"C:\root", completedDirs);
+        Assert.Contains(@"C:\root\sub1", completedDirs);
+        Assert.Contains(@"C:\root\sub2", completedDirs);
+        Assert.Contains(@"C:\root\sub2\deep", completedDirs);
+    }
 }

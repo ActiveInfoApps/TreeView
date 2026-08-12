@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using DiskSpaceTree.Diagnostics;
 using DiskSpaceTree.Models;
 
@@ -5,15 +6,42 @@ namespace DiskSpaceTree.Services;
 
 public sealed class DiskSpaceScanner
 {
-    private readonly IFileSystemAccessor _fileSystemAccessor;
-    private long _filesProcessed;
+    /// <summary>Upper limit on the number of directories whose files get scanned.</summary>
+    public const int MaxDirectoriesToScan = 30000000;
 
-    /// <summary>Raised after every directory finishes scanning.</summary>
+    private readonly IFileSystemAccessor _fileSystemAccessor;
+    private readonly ConcurrentDictionary<string, FileSystemNode> _foundDirectories = new();
+    private readonly ConcurrentDictionary<string, FileSystemNode> _scannedDirectories = new();
+    private readonly object _sortedDirectoriesLock = new();
+    private List<FileSystemNode> _sortedDirectories = [];
+    private long _filesProcessed;
+    private ScanStage _currentStage;
+
+    /// <summary>Raised after every directory finishes its file scan (stage 2).</summary>
     public event EventHandler<FileSystemNode>? DirectoryCompleted;
 
     public DiskSpaceScanner(IFileSystemAccessor fileSystemAccessor)
     {
         _fileSystemAccessor = fileSystemAccessor ?? throw new ArgumentNullException(nameof(fileSystemAccessor));
+    }
+
+    /// <summary>The total number of directories discovered during the listing stage.</summary>
+    public long DirectoriesFound => _foundDirectories.Count;
+
+    /// <summary>The number of directories whose files have been scanned so far.</summary>
+    public long DirectoriesScanned => _scannedDirectories.Count;
+
+    /// <summary>The scan stage currently being executed.</summary>
+    public ScanStage CurrentStage => _currentStage;
+
+    /// <summary>Returns the top scanned directories ranked by their own file size.</summary>
+    public IReadOnlyList<FileSystemNode> GetTopDirectories(int count)
+    {
+        lock (_sortedDirectoriesLock)
+        {
+            _sortedDirectories.Sort(CompareDirectoriesBySizeDescending);
+            return _sortedDirectories.Take(count).ToList();
+        }
     }
 
     public static IEnumerable<FileSystemNode> GetDrives()
@@ -49,12 +77,93 @@ public sealed class DiskSpaceScanner
         IProgress<ScanStatus>? progress = null,
         CancellationToken cancellationToken = default)
     {
-        await ScanDirectoryRecursiveAsync(node, progress, cancellationToken);
+        _foundDirectories.Clear();
+        _scannedDirectories.Clear();
+        lock (_sortedDirectoriesLock)
+        {
+            _sortedDirectories.Clear();
+        }
+
+        Interlocked.Exchange(ref _filesProcessed, 0);
+        _currentStage = ScanStage.ListingDirectories;
+
+        // Stage 1: build the full directory tree and count every directory found.
+        await BuildDirectoryListAsync(node, progress, cancellationToken);
+        progress?.Report(new ScanStatus(node.Path, _filesProcessed, ScanStage.ListingDirectories, DirectoriesFound, DirectoriesScanned));
+
+        // Stage 2: scan the files in every discovered directory and accumulate sizes.
+        _currentStage = ScanStage.ScanningFiles;
+        await ScanFilesAsync(node, progress, cancellationToken, isRoot: true);
     }
 
-    private async Task ScanDirectoryRecursiveAsync(FileSystemNode node, IProgress<ScanStatus>? progress, CancellationToken cancellationToken)
+    private async Task<long> BuildDirectoryListAsync(FileSystemNode node, IProgress<ScanStatus>? progress, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+
+        if (_foundDirectories.Count >= MaxDirectoriesToScan)
+        {
+            return _foundDirectories.Count;
+        }
+
+        Logger.Log($"List start: {node.Path}");
+
+        // This node itself is a directory being scanned.
+        _foundDirectories[node.Path] = node;
+
+        List<string> directories;
+        try
+        {
+            directories = _fileSystemAccessor.EnumerateDirectories(node.Path).ToList();
+        }
+        catch (Exception ex) when (ex is UnauthorizedAccessException or PathTooLongException or DirectoryNotFoundException)
+        {
+            node.HasError = true;
+            node.ErrorMessage = ex.Message;
+            Logger.Log($"Directory list error: {node.Path} -> {ex.GetType().Name}: {ex.Message}");
+            return 1;
+        }
+
+        foreach (var directory in directories)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (_foundDirectories.Count >= MaxDirectoriesToScan)
+            {
+                break;
+            }
+
+            var childName = System.IO.Path.GetFileName(directory);
+            var childNode = new FileSystemNode(childName, directory, isDirectory: true)
+            {
+                Parent = node
+            };
+
+            lock (node.SyncRoot)
+            {
+                node.Children.Add(childNode);
+            }
+
+            await BuildDirectoryListAsync(childNode, progress, cancellationToken);
+
+            if (_foundDirectories.Count % 100 == 0)
+            {
+                progress?.Report(new ScanStatus(string.Empty, _filesProcessed, ScanStage.ListingDirectories, DirectoriesFound, DirectoriesScanned));
+            }
+        }
+
+        Logger.Log($"List complete: {node.Path} -> {_foundDirectories.Count} directories total");
+        return _foundDirectories.Count;
+    }
+
+    private async Task ScanFilesAsync(FileSystemNode node, IProgress<ScanStatus>? progress, CancellationToken cancellationToken, bool isRoot)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (!isRoot && _scannedDirectories.Count >= MaxDirectoriesToScan)
+        {
+            return;
+        }
+
         Logger.Log($"Scan start: {node.Path}");
 
         long sizeInBytes = 0;
@@ -79,7 +188,7 @@ public sealed class DiskSpaceScanner
                 var processed = Interlocked.Increment(ref _filesProcessed);
                 if (processed % 100 == 0)
                 {
-                    progress?.Report(new ScanStatus(file, processed));
+                    progress?.Report(new ScanStatus(file, processed, ScanStage.ScanningFiles, DirectoriesFound, DirectoriesScanned));
                 }
             }
         }
@@ -97,43 +206,64 @@ public sealed class DiskSpaceScanner
         node.DirectSizeInKb = ConvertToKilobytes(sizeInBytes);
         node.DirectFileCount = fileCount;
 
-        try
+        // Record this directory as having its files scanned (the root is the entry point,
+        // not a "found" subdirectory, so it is excluded from the scanned count).
+        if (!isRoot)
         {
-            foreach (var directory in _fileSystemAccessor.EnumerateDirectories(node.Path))
+            var existing = _scannedDirectories.TryAdd(node.Path, node);
+            lock (_sortedDirectoriesLock)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                var childName = System.IO.Path.GetFileName(directory);
-                var childNode = new FileSystemNode(childName, directory, isDirectory: true)
+                if (existing)
                 {
-                    Parent = node
-                };
+                    _sortedDirectories.Add(node);
+                }
 
-                await ScanDirectoryRecursiveAsync(childNode, progress, cancellationToken);
-                sizeInBytes += childNode.SizeInKb * 1024;
-                fileCount += childNode.FileCount;
-                node.SizeInKb = ConvertToKilobytes(sizeInBytes);
-                node.FileCount = fileCount;
-                Logger.Log($"Child accumulated: {node.Path} <- {childNode.Path} ({childNode.SizeInKb} KB / {childNode.FileCount} files) => running total {sizeInBytes} bytes / {fileCount} files");
-
-                lock (node.SyncRoot)
+                // Re-sort the list only after every 100 scanned directories.
+                if (_scannedDirectories.Count % 100 == 0)
                 {
-                    InsertChildSorted(node, childNode);
+                    _sortedDirectories.Sort(CompareDirectoriesBySizeDescending);
                 }
             }
         }
-        catch (Exception ex) when (ex is UnauthorizedAccessException or PathTooLongException or DirectoryNotFoundException)
+
+        List<FileSystemNode> children;
+        lock (node.SyncRoot)
         {
-            node.HasError = true;
-            node.ErrorMessage = ex.Message;
-            Logger.Log($"Directory error: {node.Path} -> {ex.GetType().Name}: {ex.Message}");
+            children = node.Children.ToList();
+        }
+
+        foreach (var childNode in children)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            await ScanFilesAsync(childNode, progress, cancellationToken, isRoot: false);
+            sizeInBytes += childNode.SizeInKb * 1024;
+            fileCount += childNode.FileCount;
+
+            lock (node.SyncRoot)
+            {
+                node.Children.Remove(childNode);
+                InsertChildSorted(node, childNode);
+            }
         }
 
         node.SizeInKb = ConvertToKilobytes(sizeInBytes);
         node.FileCount = fileCount;
         Logger.Log($"Scan complete: {node.Path} -> {node.SizeInKb} KB / {node.FileCount} files");
         node.RaiseEvent();
+
+        var scanned = DirectoriesScanned;
+        if (scanned % 50 == 0 && scanned > 0)
+        {
+            progress?.Report(new ScanStatus(node.Path, _filesProcessed, ScanStage.ScanningFiles, DirectoriesFound, DirectoriesScanned));
+        }
+
         DirectoryCompleted?.Invoke(this, node);
+    }
+
+    private static int CompareDirectoriesBySizeDescending(FileSystemNode? x, FileSystemNode? y)
+    {
+        return y?.DirectSizeInKb.CompareTo(x?.DirectSizeInKb ?? 0) ?? 0;
     }
 
     private static long ConvertToKilobytes(long bytes)
