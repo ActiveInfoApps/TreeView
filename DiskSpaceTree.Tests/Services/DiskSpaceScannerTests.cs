@@ -286,23 +286,24 @@ public class DiskSpaceScannerTests
     }
 
     [Fact]
-    public async Task ScanDirectoryAsync_StopsListingAtDefaultLimit()
+    public async Task ScanDirectoryAsync_StopsListingAtConfiguredLimit()
     {
+        const int limit = 100;
         var fs = new InMemoryFileSystemAccessor();
         fs.AddDirectory(@"C:\root");
-        for (var i = 0; i < DiskSpaceScanner.MaxDirectoriesToScan + 100; i++)
+        for (var i = 0; i < limit + 50; i++)
         {
             fs.AddChildDirectory(@"C:\root", $"dir{i}");
         }
 
-        var scanner = new DiskSpaceScanner(fs);
+        var scanner = new DiskSpaceScanner(fs, limit);
         var result = CreateNode(@"C:\root");
 
         await scanner.ScanDirectoryAsync(result);
 
-        Assert.Equal(DiskSpaceScanner.MaxDirectoriesToScan, scanner.DirectoriesFound);
+        Assert.Equal(limit, scanner.DirectoriesFound);
         // The root node fills one slot of the found-directories dictionary.
-        Assert.Equal(DiskSpaceScanner.MaxDirectoriesToScan - 1, result.Children.Count);
+        Assert.Equal(limit - 1, result.Children.Count);
     }
 
     [Fact]

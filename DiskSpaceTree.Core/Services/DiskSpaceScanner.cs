@@ -7,23 +7,27 @@ namespace DiskSpaceTree.Services;
 public sealed class DiskSpaceScanner
 {
     /// <summary>Upper limit on the number of directories whose files get scanned.</summary>
-    public const int MaxDirectoriesToScan = 30000000;
+    public const int DefaultMaxDirectoriesToScan = 30000000;
 
     private readonly IFileSystemAccessor _fileSystemAccessor;
     private readonly ConcurrentDictionary<string, FileSystemNode> _foundDirectories = new();
     private readonly ConcurrentDictionary<string, FileSystemNode> _scannedDirectories = new();
     private readonly object _sortedDirectoriesLock = new();
     private List<FileSystemNode> _sortedDirectories = [];
+    private readonly ConcurrentBag<Task> _listingTasks = new();
     private long _filesProcessed;
     private ScanStage _currentStage;
 
     /// <summary>Raised after every directory finishes its file scan (stage 2).</summary>
     public event EventHandler<FileSystemNode>? DirectoryCompleted;
 
-    public DiskSpaceScanner(IFileSystemAccessor fileSystemAccessor)
+    public DiskSpaceScanner(IFileSystemAccessor fileSystemAccessor, int maxDirectoriesToScan = DefaultMaxDirectoriesToScan)
     {
         _fileSystemAccessor = fileSystemAccessor ?? throw new ArgumentNullException(nameof(fileSystemAccessor));
+        MaxDirectoriesToScan = maxDirectoriesToScan;
     }
+
+    public int MaxDirectoriesToScan { get; }
 
     /// <summary>The total number of directories discovered during the listing stage.</summary>
     public long DirectoriesFound => _foundDirectories.Count;
@@ -79,6 +83,11 @@ public sealed class DiskSpaceScanner
     {
         _foundDirectories.Clear();
         _scannedDirectories.Clear();
+        while (!_listingTasks.IsEmpty)
+        {
+            _listingTasks.TryTake(out _);
+        }
+
         lock (_sortedDirectoriesLock)
         {
             _sortedDirectories.Clear();
@@ -88,7 +97,21 @@ public sealed class DiskSpaceScanner
         _currentStage = ScanStage.ListingDirectories;
 
         // Stage 1: build the full directory tree and count every directory found.
-        await BuildDirectoryListAsync(node, progress, cancellationToken);
+        await BuildDirectoryListAsync(node, progress, cancellationToken, depth: 0);
+
+        // Wait for every subtree task dispatched during the listing to finish so the
+        // tree is fully built before file scanning begins.
+        while (!_listingTasks.IsEmpty)
+        {
+            var pending = new List<Task>();
+            while (_listingTasks.TryTake(out var task))
+            {
+                pending.Add(task);
+            }
+
+            await Task.WhenAll(pending);
+        }
+
         progress?.Report(new ScanStatus(node.Path, _filesProcessed, ScanStage.ListingDirectories, DirectoriesFound, DirectoriesScanned));
 
         // Stage 2: scan the files in every discovered directory and accumulate sizes.
@@ -96,7 +119,8 @@ public sealed class DiskSpaceScanner
         await ScanFilesAsync(node, progress, cancellationToken, isRoot: true);
     }
 
-    private async Task<long> BuildDirectoryListAsync(FileSystemNode node, IProgress<ScanStatus>? progress, CancellationToken cancellationToken)
+    private async Task<long> BuildDirectoryListAsync(FileSystemNode node, IProgress<ScanStatus>? progress,
+        CancellationToken cancellationToken, int depth)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
@@ -123,6 +147,12 @@ public sealed class DiskSpaceScanner
             return 1;
         }
 
+        // At the fan-out level, dispatch a task per subdirectory without waiting on them.
+        // The walker keeps moving to the next sibling, so it never blocks on the subtrees.
+        var dispatchTasks = depth >= 2;
+
+        // Down to the fan-out level, walk level by level; the count limit is then
+        // respected because each child fills its found slot before the next is added.
         foreach (var directory in directories)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -143,11 +173,20 @@ public sealed class DiskSpaceScanner
                 node.Children.Add(childNode);
             }
 
-            await BuildDirectoryListAsync(childNode, progress, cancellationToken);
-
             if (_foundDirectories.Count % 100 == 0)
             {
                 progress?.Report(new ScanStatus(string.Empty, _filesProcessed, ScanStage.ListingDirectories, DirectoriesFound, DirectoriesScanned));
+            }
+
+            if (dispatchTasks)
+            {
+                _listingTasks.Add(Task.Run(() => 
+                        BuildDirectoryListAsync(childNode, progress, 
+                            cancellationToken, depth + 1), cancellationToken));
+            }
+            else
+            {
+                await BuildDirectoryListAsync(childNode, progress, cancellationToken, depth + 1);
             }
         }
 
