@@ -75,6 +75,63 @@ public class DiskSpaceScannerTests
     }
 
     [Fact]
+    public async Task ScanDirectoryAsync_NestedDirectories_AccumulatesRecursiveFileCount()
+    {
+        var fs = new InMemoryFileSystemAccessor();
+        fs.AddFile(@"C:\root", "root.txt", 2048);
+        fs.AddFile(@"C:\root", "root2.txt", 512);
+        fs.AddChildDirectory(@"C:\root", "sub");
+        fs.AddFile(@"C:\root\sub", "sub.txt", 512);
+        fs.AddFile(@"C:\root\sub", "sub2.txt", 512);
+        fs.AddChildDirectory(@"C:\root\sub", "deep");
+        fs.AddFile(@"C:\root\sub\deep", "deep.txt", 1024);
+        var scanner = new DiskSpaceScanner(fs);
+        var result = CreateNode(@"C:\root");
+
+        await scanner.ScanDirectoryAsync(result);
+
+        // root: 2 files + sub's 2 + deep's 1 = 5
+        // sub: 2 + deep's 1 = 3
+        // deep: 1
+        Assert.Equal(5, result.FileCount);
+        var sub = result.Children[0];
+        Assert.Equal(3, sub.FileCount);
+        var deep = sub.Children[0];
+        Assert.Equal(1, deep.FileCount);
+    }
+
+    [Fact]
+    public async Task ScanDirectoryAsync_DirectTotalsExcludeSubdirectories()
+    {
+        var fs = new InMemoryFileSystemAccessor();
+        fs.AddFile(@"C:\root", "root.txt", 2048);
+        fs.AddFile(@"C:\root", "root2.txt", 512);
+        fs.AddChildDirectory(@"C:\root", "sub");
+        fs.AddFile(@"C:\root\sub", "sub.txt", 512);
+        fs.AddFile(@"C:\root\sub", "sub2.txt", 512);
+        fs.AddChildDirectory(@"C:\root\sub", "deep");
+        fs.AddFile(@"C:\root\sub\deep", "deep.txt", 1024);
+        var scanner = new DiskSpaceScanner(fs);
+        var result = CreateNode(@"C:\root");
+
+        await scanner.ScanDirectoryAsync(result);
+
+        // Root directly contains 2 files = 2048 + 512 = 2560 bytes -> 3 KB.
+        Assert.Equal(3, result.DirectSizeInKb);
+        Assert.Equal(2, result.DirectFileCount);
+
+        // Sub directly contains 2 files = 1024 bytes -> 1 KB, excluding deep.
+        var sub = result.Children[0];
+        Assert.Equal(1, sub.DirectSizeInKb);
+        Assert.Equal(2, sub.DirectFileCount);
+
+        // Deep directly contains 1 file.
+        var deep = sub.Children[0];
+        Assert.Equal(1, deep.DirectSizeInKb);
+        Assert.Equal(1, deep.DirectFileCount);
+    }
+
+    [Fact]
     public async Task ScanDirectoryAsync_ChildrenAreSortedBySizeDescending()
     {
         var fs = new InMemoryFileSystemAccessor();

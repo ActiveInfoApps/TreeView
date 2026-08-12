@@ -8,6 +8,9 @@ public sealed class DiskSpaceScanner
     private readonly IFileSystemAccessor _fileSystemAccessor;
     private long _filesProcessed;
 
+    /// <summary>Raised after every directory finishes scanning.</summary>
+    public event EventHandler<FileSystemNode>? DirectoryCompleted;
+
     public DiskSpaceScanner(IFileSystemAccessor fileSystemAccessor)
     {
         _fileSystemAccessor = fileSystemAccessor ?? throw new ArgumentNullException(nameof(fileSystemAccessor));
@@ -55,6 +58,7 @@ public sealed class DiskSpaceScanner
         Logger.Log($"Scan start: {node.Path}");
 
         long sizeInBytes = 0;
+        long fileCount = 0;
 
         try
         {
@@ -71,6 +75,7 @@ public sealed class DiskSpaceScanner
                     Logger.Log($"File error: {file} -> {ex.GetType().Name}");
                 }
 
+                fileCount++;
                 var processed = Interlocked.Increment(ref _filesProcessed);
                 if (processed % 100 == 0)
                 {
@@ -85,7 +90,12 @@ public sealed class DiskSpaceScanner
             Logger.Log($"Directory error: {node.Path} -> {ex.GetType().Name}: {ex.Message}");
         }
 
-        Logger.Log($"Files scanned: {node.Path} -> {sizeInBytes} bytes");
+        Logger.Log($"Files scanned: {node.Path} -> {sizeInBytes} bytes / {fileCount} files");
+
+        // Direct totals (files in this directory only, excluding subdirectories) are the
+        // value before any child accumulation.
+        node.DirectSizeInKb = ConvertToKilobytes(sizeInBytes);
+        node.DirectFileCount = fileCount;
 
         try
         {
@@ -101,8 +111,10 @@ public sealed class DiskSpaceScanner
 
                 await ScanDirectoryRecursiveAsync(childNode, progress, cancellationToken);
                 sizeInBytes += childNode.SizeInKb * 1024;
+                fileCount += childNode.FileCount;
                 node.SizeInKb = ConvertToKilobytes(sizeInBytes);
-                Logger.Log($"Child accumulated: {node.Path} <- {childNode.Path} ({childNode.SizeInKb} KB) => running total {sizeInBytes} bytes");
+                node.FileCount = fileCount;
+                Logger.Log($"Child accumulated: {node.Path} <- {childNode.Path} ({childNode.SizeInKb} KB / {childNode.FileCount} files) => running total {sizeInBytes} bytes / {fileCount} files");
 
                 lock (node.SyncRoot)
                 {
@@ -118,8 +130,10 @@ public sealed class DiskSpaceScanner
         }
 
         node.SizeInKb = ConvertToKilobytes(sizeInBytes);
-        Logger.Log($"Scan complete: {node.Path} -> {node.SizeInKb} KB");
+        node.FileCount = fileCount;
+        Logger.Log($"Scan complete: {node.Path} -> {node.SizeInKb} KB / {node.FileCount} files");
         node.RaiseEvent();
+        DirectoryCompleted?.Invoke(this, node);
     }
 
     private static long ConvertToKilobytes(long bytes)

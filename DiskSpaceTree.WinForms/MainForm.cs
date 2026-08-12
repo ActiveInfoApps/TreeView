@@ -15,6 +15,7 @@ public partial class MainForm : Form
     private readonly ToolStripStatusLabel _statusCountLabel;
     private readonly ToolStripStatusLabel _statusTotalSizeLabel;
     private readonly TreeView _treeView;
+    private readonly DataGridView _topDirectoriesGrid;
     private FileSystemNode? _rootNode;
     private readonly ComboBox _driveComboBox;
     private readonly Button _scanButton;
@@ -24,12 +25,16 @@ public partial class MainForm : Form
     private readonly System.Windows.Forms.Timer _updateTimer;
     private readonly HashSet<FileSystemNode> _dirtyNodes = [];
     private readonly Dictionary<FileSystemNode, TreeNode> _nodeMap = [];
-    private TreeNode rootTreeNode;
-    private FileSystemNode driveNode;
+    private readonly TabControl _tabControl;
+    private readonly TabPage _treeTabPage;
+    private readonly TabPage _topDirectoriesTabPage;
+    private long _directoriesScannedCount;
+    private string _topDirectoriesHash = string.Empty;
 
     public MainForm()
     {
         _scanner = new DiskSpaceScanner(new FileSystemAccessor());
+        _scanner.DirectoryCompleted += Scanner_DirectoryCompleted;
 
         Text = "Disk Space Tree";
         Size = new Size(900, 600);
@@ -74,7 +79,7 @@ public partial class MainForm : Form
 
         _cancelButton = new Button
         {
-            Text = "Cancel",
+            Text = "Stop",
             Width = 75,
             Height = 23,
             Enabled = false,
@@ -129,7 +134,72 @@ public partial class MainForm : Form
         statusStrip.Items.Add(_statusCountLabel);
         statusStrip.Items.Add(_statusTotalSizeLabel);
 
-        Controls.Add(_treeView);
+        _topDirectoriesGrid = new DataGridView
+        {
+            Dock = DockStyle.Fill,
+            ReadOnly = true,
+            AllowUserToAddRows = false,
+            AllowUserToDeleteRows = false,
+            AllowUserToResizeRows = false,
+            RowHeadersVisible = false,
+            AutoGenerateColumns = false,
+            AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+            SelectionMode = DataGridViewSelectionMode.FullRowSelect
+        };
+        _topDirectoriesGrid.CellDoubleClick += TopDirectoriesGrid_CellDoubleClick;
+
+        _topDirectoriesGrid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = "Name",
+            DataPropertyName = "Name",
+            FillWeight = 30,
+            ReadOnly = true
+        });
+        _topDirectoriesGrid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = "Full Path",
+            DataPropertyName = "Path",
+            FillWeight = 45,
+            ReadOnly = true
+        });
+        _topDirectoriesGrid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = "Files",
+            DataPropertyName = "DirectFileCount",
+            FillWeight = 10,
+            ReadOnly = true,
+            DefaultCellStyle = { Format = "N0", Alignment = DataGridViewContentAlignment.MiddleRight }
+        });
+        _topDirectoriesGrid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = "Total Size",
+            DataPropertyName = "DirectSizeDisplay",
+            FillWeight = 15,
+            ReadOnly = true,
+            DefaultCellStyle = { Alignment = DataGridViewContentAlignment.MiddleRight }
+        });
+
+        _treeTabPage = new TabPage("Tree View") { Dock = DockStyle.Fill };
+        _treeTabPage.Controls.Add(_treeView);
+
+        _topDirectoriesTabPage = new TabPage("Top 20 Directories") { Dock = DockStyle.Fill };
+
+        var topHintLabel = new Label
+        {
+            Text = "Double-click a row to open the directory in Explorer.",
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            Padding = new Padding(5, 5, 5, 5),
+            Font = new Font(Font.FontFamily, Font.Size, FontStyle.Bold)
+        };
+        _topDirectoriesTabPage.Controls.Add(_topDirectoriesGrid);
+        _topDirectoriesTabPage.Controls.Add(topHintLabel);
+
+        _tabControl = new TabControl { Dock = DockStyle.Fill };
+        _tabControl.TabPages.Add(_treeTabPage);
+        _tabControl.TabPages.Add(_topDirectoriesTabPage);
+
+        Controls.Add(_tabControl);
         Controls.Add(topPanel);
         Controls.Add(statusStrip);
 
@@ -196,16 +266,19 @@ public partial class MainForm : Form
         // Create a fresh node for each scan so previous results do not accumulate.
         var driveNode = new FileSystemNode(selectedDrive.Name, selectedDrive.Path, selectedDrive.IsDirectory);
         _rootNode = driveNode;
+        _directoriesScannedCount = 0;
+        _topDirectoriesHash = string.Empty;
 
         _cancellationTokenSource = new CancellationTokenSource();
         IsBusy = true;
 
         _treeView.Nodes.Clear();
+        _topDirectoriesGrid.DataSource = null;
         _statusPathLabel.Text = string.Empty;
         _statusCountLabel.Text = "Files: 0";
         _statusLabel.Text = "Scanning...";
 
-        rootTreeNode = CreateTreeNode(driveNode);
+        var rootTreeNode = CreateTreeNode(driveNode);
         _treeView.Nodes.Add(rootTreeNode);
         SubscribeToNode(driveNode, rootTreeNode);
         rootTreeNode.Expand();
@@ -225,7 +298,7 @@ public partial class MainForm : Form
         }
         catch (OperationCanceledException)
         {
-            _statusLabel.Text = "Scan cancelled.";
+            _statusLabel.Text = "Scan stopped.";
         }
         catch (Exception ex)
         {
@@ -233,6 +306,8 @@ public partial class MainForm : Form
         }
         finally
         {
+            // Even when the scan is stopped early, generate the summary from whatever was scanned so far.
+            PopulateTopDirectories(driveNode);
             IsBusy = false;
             _cancellationTokenSource?.Dispose();
             _cancellationTokenSource = null;
@@ -242,6 +317,23 @@ public partial class MainForm : Form
     private void CancelButton_Click(object? sender, EventArgs e)
     {
         _cancellationTokenSource?.Cancel();
+    }
+
+    private void Scanner_DirectoryCompleted(object? sender, FileSystemNode node)
+    {
+        if (_rootNode is null)
+        {
+            return;
+        }
+
+        var completed = Interlocked.Increment(ref _directoriesScannedCount);
+        if (completed % 20 != 0)
+        {
+            return;
+        }
+
+        var rootNode = _rootNode;
+        InvokeOnUiThread(() => PopulateTopDirectories(rootNode));
     }
 
     private bool IsBusy
@@ -290,14 +382,29 @@ public partial class MainForm : Form
     {
         if (_treeView.SelectedNode?.Tag is FileSystemNode node)
         {
-            try
-            {
-                Process.Start(new ProcessStartInfo("explorer.exe", $"\"{node.Path}\"") { UseShellExecute = true });
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show($"Failed to open Explorer: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
+            OpenInExplorer(node);
+        }
+    }
+
+    private void TopDirectoriesGrid_CellDoubleClick(object? sender, DataGridViewCellEventArgs e)
+    {
+        if (e.RowIndex < 0 || _topDirectoriesGrid.Rows[e.RowIndex].DataBoundItem is not FileSystemNode node)
+        {
+            return;
+        }
+
+        OpenInExplorer(node);
+    }
+
+    private static void OpenInExplorer(FileSystemNode node)
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo("explorer.exe", $"\"{node.Path}\"") { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Failed to open Explorer: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 
@@ -435,6 +542,61 @@ public partial class MainForm : Form
         else
         {
             action();
+        }
+    }
+
+    private void PopulateTopDirectories(FileSystemNode rootNode)
+    {
+        var directories = new List<FileSystemNode>();
+        CollectDirectories(rootNode, directories);
+
+        // The drive node itself always has the largest total size, so exclude it from the top 20.
+        // Rank directories by the size of their own files only, excluding subdirectories.
+        var top = directories
+            .Where(d => !ReferenceEquals(d, rootNode))
+            .OrderByDescending(d => d.DirectSizeInKb)
+            .Take(20)
+            .ToList();
+
+        var hash = ComputeDirectoryHash(top);
+        if (hash == _topDirectoriesHash)
+        {
+            return;
+        }
+
+        _topDirectoriesHash = hash;
+        _topDirectoriesGrid.DataSource = top;
+    }
+
+    private static string ComputeDirectoryHash(List<FileSystemNode> directories)
+    {
+        var builder = new System.Text.StringBuilder();
+        foreach (var node in directories)
+        {
+            builder.Append(node.Path).Append('|')
+                   .Append(node.Name).Append('|')
+                   .Append(node.DirectFileCount).Append('|')
+                   .Append(node.DirectSizeInKb).Append(';');
+        }
+
+        using var md5 = System.Security.Cryptography.MD5.Create();
+        var bytes = System.Text.Encoding.UTF8.GetBytes(builder.ToString());
+        var hashBytes = md5.ComputeHash(bytes);
+        return Convert.ToHexString(hashBytes);
+    }
+
+    private static void CollectDirectories(FileSystemNode node, List<FileSystemNode> result)
+    {
+        List<FileSystemNode> children;
+        lock (node.SyncRoot)
+        {
+            children = node.Children.ToList();
+        }
+
+        foreach (var child in children)
+        {
+            result.Add(child);
+            CollectDirectories(child, result);
         }
     }
 }

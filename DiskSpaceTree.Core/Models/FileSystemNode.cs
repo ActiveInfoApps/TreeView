@@ -8,6 +8,7 @@ namespace DiskSpaceTree.Models;
 public sealed class FileSystemNode : INotifyPropertyChanged
 {
     private long _sizeInKb;
+    private long _fileCount;
     private bool _isExpanded;
     private bool _hasError;
     private string? _errorMessage;
@@ -39,6 +40,17 @@ public sealed class FileSystemNode : INotifyPropertyChanged
         set => SetProperty(ref _sizeInKb, value);
     }
 
+    public long FileCount
+    {
+        get => _fileCount;
+        set => SetProperty(ref _fileCount, value);
+    }
+
+    // Size of the files located directly in this directory, excluding any subdirectories.
+    public long DirectSizeInKb { get; internal set; }
+
+    public long DirectFileCount { get; internal set; }
+
     public bool IsExpanded
     {
         get => _isExpanded;
@@ -58,6 +70,8 @@ public sealed class FileSystemNode : INotifyPropertyChanged
     }
 
     public string DisplaySize => $"{SizeInKb:N0} KB";
+
+    public string DirectSizeDisplay => $"{DirectSizeInKb:N0} KB";
 
     public string DisplayText => IsDirectory
         ? $"{Name} ({DisplaySize})"
