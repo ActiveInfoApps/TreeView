@@ -8,6 +8,7 @@ public sealed class DiskSpaceScanner
 {
     /// <summary>Upper limit on the number of directories whose files get scanned.</summary>
     public const int DefaultMaxDirectoriesToScan = 30000000;
+    public const int DirectoryScanTaskDepth = 4;
 
     private readonly IFileSystemAccessor _fileSystemAccessor;
     private readonly ConcurrentDictionary<string, FileSystemNode> _foundDirectories = new();
@@ -149,7 +150,7 @@ public sealed class DiskSpaceScanner
 
         // At the fan-out level, dispatch a task per subdirectory without waiting on them.
         // The walker keeps moving to the next sibling, so it never blocks on the subtrees.
-        var dispatchTasks = depth >= 2;
+        var dispatchTasks = depth >= DirectoryScanTaskDepth;
 
         // Down to the fan-out level, walk level by level; the count limit is then
         // respected because each child fills its found slot before the next is added.
