@@ -13,7 +13,9 @@ public partial class MainForm : Form
     private bool _isBusy;
     private readonly ToolStripStatusLabel _statusPathLabel;
     private readonly ToolStripStatusLabel _statusCountLabel;
+    private readonly ToolStripStatusLabel _statusTotalSizeLabel;
     private readonly TreeView _treeView;
+    private FileSystemNode? _rootNode;
     private readonly ComboBox _driveComboBox;
     private readonly Button _scanButton;
     private readonly Button _cancelButton;
@@ -22,13 +24,12 @@ public partial class MainForm : Form
     private readonly System.Windows.Forms.Timer _updateTimer;
     private readonly HashSet<FileSystemNode> _dirtyNodes = [];
     private readonly Dictionary<FileSystemNode, TreeNode> _nodeMap = [];
+    private TreeNode rootTreeNode;
+    private FileSystemNode driveNode;
 
     public MainForm()
     {
-        _scanner = new DiskSpaceScanner(new FileSystemAccessor())
-        {
-            AddDirectoriesBeforeScan = true
-        };
+        _scanner = new DiskSpaceScanner(new FileSystemAccessor());
 
         Text = "Disk Space Tree";
         Size = new Size(900, 600);
@@ -123,8 +124,10 @@ public partial class MainForm : Form
             TextAlign = ContentAlignment.MiddleLeft
         };
         _statusCountLabel = new ToolStripStatusLabel { Text = "Files: 0" };
+        _statusTotalSizeLabel = new ToolStripStatusLabel { Text = "Total: 0 KB" };
         statusStrip.Items.Add(_statusPathLabel);
         statusStrip.Items.Add(_statusCountLabel);
+        statusStrip.Items.Add(_statusTotalSizeLabel);
 
         Controls.Add(_treeView);
         Controls.Add(topPanel);
@@ -132,6 +135,7 @@ public partial class MainForm : Form
 
         _updateTimer = new System.Windows.Forms.Timer { Interval = 100 };
         _updateTimer.Tick += UpdateTimer_Tick;
+        _updateTimer.Start();
 
         LoadDrives();
     }
@@ -159,7 +163,10 @@ public partial class MainForm : Form
             _treeView.EndUpdate();
         }
 
-        _updateTimer.Stop();
+        if (_rootNode != null)
+        {
+            _statusTotalSizeLabel.Text = $"Total: {_rootNode.DisplaySize}";
+        }
     }
 
     private void LoadDrives()
@@ -188,6 +195,7 @@ public partial class MainForm : Form
 
         // Create a fresh node for each scan so previous results do not accumulate.
         var driveNode = new FileSystemNode(selectedDrive.Name, selectedDrive.Path, selectedDrive.IsDirectory);
+        _rootNode = driveNode;
 
         _cancellationTokenSource = new CancellationTokenSource();
         IsBusy = true;
@@ -197,7 +205,7 @@ public partial class MainForm : Form
         _statusCountLabel.Text = "Files: 0";
         _statusLabel.Text = "Scanning...";
 
-        var rootTreeNode = CreateTreeNode(driveNode);
+        rootTreeNode = CreateTreeNode(driveNode);
         _treeView.Nodes.Add(rootTreeNode);
         SubscribeToNode(driveNode, rootTreeNode);
         rootTreeNode.Expand();
@@ -334,7 +342,13 @@ public partial class MainForm : Form
             InvokeOnUiThread(() => HandleChildrenChanged(treeNode, node, e));
         };
 
-        foreach (var child in node.Children)
+        List<FileSystemNode> children;
+        lock (node.SyncRoot)
+        {
+            children = node.Children.ToList();
+        }
+
+        foreach (var child in children)
         {
             var childTreeNode = CreateTreeNode(child);
             treeNode.Nodes.Add(childTreeNode);
@@ -348,14 +362,6 @@ public partial class MainForm : Form
         {
             _dirtyNodes.Add(node);
         }
-
-        InvokeOnUiThread(() =>
-        {
-            if (!_updateTimer.Enabled)
-            {
-                _updateTimer.Start();
-            }
-        });
     }
 
     private void HandleChildrenChanged(TreeNode parentTreeNode, FileSystemNode parentNode, NotifyCollectionChangedEventArgs e)
@@ -401,8 +407,14 @@ public partial class MainForm : Form
                 break;
 
             case NotifyCollectionChangedAction.Reset:
+                List<FileSystemNode> resetChildren;
+                lock (parentNode.SyncRoot)
+                {
+                    resetChildren = parentNode.Children.ToList();
+                }
+
                 parentTreeNode.Nodes.Clear();
-                foreach (var child in parentNode.Children)
+                foreach (var child in resetChildren)
                 {
                     var childTreeNode = CreateTreeNode(child);
                     parentTreeNode.Nodes.Add(childTreeNode);

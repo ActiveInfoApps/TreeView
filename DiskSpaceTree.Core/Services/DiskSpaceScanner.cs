@@ -1,4 +1,4 @@
-using System.ComponentModel;
+using DiskSpaceTree.Diagnostics;
 using DiskSpaceTree.Models;
 
 namespace DiskSpaceTree.Services;
@@ -12,12 +12,6 @@ public sealed class DiskSpaceScanner
     {
         _fileSystemAccessor = fileSystemAccessor ?? throw new ArgumentNullException(nameof(fileSystemAccessor));
     }
-
-    /// <summary>
-    /// When true, each child directory is added to its parent before it is scanned
-    /// and moved to the correct sorted position after the scan completes.
-    /// </summary>
-    public bool AddDirectoriesBeforeScan { get; set; }
 
     public static IEnumerable<FileSystemNode> GetDrives()
     {
@@ -58,11 +52,9 @@ public sealed class DiskSpaceScanner
     private async Task ScanDirectoryRecursiveAsync(FileSystemNode node, IProgress<ScanStatus>? progress, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-
-        Thread.Sleep(100);
+        Logger.Log($"Scan start: {node.Path}");
 
         long sizeInBytes = 0;
-        var spawnedTasks = new List<Task>();
 
         try
         {
@@ -76,25 +68,24 @@ public sealed class DiskSpaceScanner
                 }
                 catch (Exception ex) when (ex is UnauthorizedAccessException or FileNotFoundException or PathTooLongException)
                 {
-                    // Ignore files we cannot read.
+                    Logger.Log($"File error: {file} -> {ex.GetType().Name}");
                 }
 
-                // Update size periodically so the UI shows live progress.
-                node.SizeInKb = ConvertToKilobytes(sizeInBytes);
-
-                // Report status so the UI can show the current file and processed count.
                 var processed = Interlocked.Increment(ref _filesProcessed);
-                progress?.Report(new ScanStatus(file, processed));
-
-                // Yield frequently so the UI can render between files.
-                await Task.Yield();
+                if (processed % 100 == 0)
+                {
+                    progress?.Report(new ScanStatus(file, processed));
+                }
             }
         }
         catch (Exception ex) when (ex is UnauthorizedAccessException or PathTooLongException or DirectoryNotFoundException)
         {
             node.HasError = true;
             node.ErrorMessage = ex.Message;
+            Logger.Log($"Directory error: {node.Path} -> {ex.GetType().Name}: {ex.Message}");
         }
+
+        Logger.Log($"Files scanned: {node.Path} -> {sizeInBytes} bytes");
 
         try
         {
@@ -103,112 +94,32 @@ public sealed class DiskSpaceScanner
                 cancellationToken.ThrowIfCancellationRequested();
 
                 var childName = System.IO.Path.GetFileName(directory);
-                var childNode = new FileSystemNode(childName, directory, isDirectory: true);
-
-                if (AddDirectoriesBeforeScan)
+                var childNode = new FileSystemNode(childName, directory, isDirectory: true)
                 {
-                    lock (node.SyncRoot)
-                    {
-                        node.Children.Add(childNode);
-                    }
-                }
+                    Parent = node
+                };
 
-                // Count files in the child directory to decide whether to scan it in a background task.
-                int fileCount = 0;
-                try
+                await ScanDirectoryRecursiveAsync(childNode, progress, cancellationToken);
+                sizeInBytes += childNode.SizeInKb * 1024;
+                node.SizeInKb = ConvertToKilobytes(sizeInBytes);
+                Logger.Log($"Child accumulated: {node.Path} <- {childNode.Path} ({childNode.SizeInKb} KB) => running total {sizeInBytes} bytes");
+
+                lock (node.SyncRoot)
                 {
-                    fileCount = _fileSystemAccessor.EnumerateFiles(directory).Count();
+                    InsertChildSorted(node, childNode);
                 }
-                catch (Exception ex) when (ex is UnauthorizedAccessException or FileNotFoundException or PathTooLongException)
-                {
-                    // If we cannot count files, treat it as a non-heavy directory and let the scan handle the error.
-                    fileCount = 0;
-                }
-
-                if (fileCount > 200)
-                {
-                    // Heavy directory: start a background task and continue with the next directory.
-                    var task = Task.Run(async () =>
-                    {
-                        await ScanDirectoryRecursiveAsync(childNode, progress, cancellationToken);
-
-                        lock (node.SyncRoot)
-                        {
-                            sizeInBytes += childNode.SizeInKb * 1024;
-                            node.SizeInKb = ConvertToKilobytes(sizeInBytes);
-
-                            if (AddDirectoriesBeforeScan)
-                            {
-                                node.Children.Remove(childNode);
-                            }
-
-                            InsertChildSorted(node, childNode);
-                        }
-                    }, cancellationToken);
-
-                    spawnedTasks.Add(task);
-                }
-                else
-                {
-                    long childSizeAtStart = 0;
-                    PropertyChangedEventHandler? childSizeChanged = null;
-
-                    if (AddDirectoriesBeforeScan)
-                    {
-                        childSizeChanged = (s, e) =>
-                        {
-                            if (e.PropertyName == nameof(FileSystemNode.SizeInKb))
-                            {
-                                lock (node.SyncRoot)
-                                {
-                                    var delta = (childNode.SizeInKb - childSizeAtStart) * 1024;
-                                    sizeInBytes += delta;
-                                    childSizeAtStart = childNode.SizeInKb;
-                                    node.SizeInKb = ConvertToKilobytes(sizeInBytes);
-                                }
-                            }
-                        };
-                        childNode.PropertyChanged += childSizeChanged;
-                    }
-
-                    await ScanDirectoryRecursiveAsync(childNode, progress, cancellationToken);
-
-                    if (childSizeChanged != null)
-                    {
-                        childNode.PropertyChanged -= childSizeChanged;
-                    }
-                    else
-                    {
-                        lock (node.SyncRoot)
-                        {
-                            sizeInBytes += childNode.SizeInKb * 1024;
-                            node.SizeInKb = ConvertToKilobytes(sizeInBytes);
-                        }
-                    }
-
-                    lock (node.SyncRoot)
-                    {
-                        if (AddDirectoriesBeforeScan)
-                        {
-                            node.Children.Remove(childNode);
-                        }
-
-                        InsertChildSorted(node, childNode);
-                    }
-                }
-
-                await Task.Yield();
             }
         }
         catch (Exception ex) when (ex is UnauthorizedAccessException or PathTooLongException or DirectoryNotFoundException)
         {
             node.HasError = true;
             node.ErrorMessage = ex.Message;
+            Logger.Log($"Directory error: {node.Path} -> {ex.GetType().Name}: {ex.Message}");
         }
 
-        await Task.WhenAll(spawnedTasks);
-
         node.SizeInKb = ConvertToKilobytes(sizeInBytes);
+        Logger.Log($"Scan complete: {node.Path} -> {node.SizeInKb} KB");
+        node.RaiseEvent();
     }
 
     private static long ConvertToKilobytes(long bytes)
@@ -226,4 +137,5 @@ public sealed class DiskSpaceScanner
 
         parent.Children.Insert(index, child);
     }
+
 }

@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
+using DiskSpaceTree.Diagnostics;
 
 namespace DiskSpaceTree.Models;
 
@@ -11,6 +12,8 @@ public sealed class FileSystemNode : INotifyPropertyChanged
     private bool _hasError;
     private string? _errorMessage;
     public readonly object SyncRoot = new();
+    const int CounterSize = 30;
+    public int NotificationCounter { get; set; }
 
     public FileSystemNode(string name, string path, bool isDirectory)
     {
@@ -25,6 +28,8 @@ public sealed class FileSystemNode : INotifyPropertyChanged
     public string Path { get; }
 
     public bool IsDirectory { get; }
+
+    public FileSystemNode? Parent { get; internal set; }
 
     public ObservableCollection<FileSystemNode> Children { get; }
 
@@ -60,6 +65,12 @@ public sealed class FileSystemNode : INotifyPropertyChanged
 
     public event PropertyChangedEventHandler? PropertyChanged;
 
+    public void RaiseEvent()
+    {
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(DisplaySize)));
+        PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(DisplayText)));
+    }
+
     private bool SetProperty<T>(ref T field, T value, [CallerMemberName] string propertyName = "")
     {
         lock (SyncRoot)
@@ -69,7 +80,14 @@ public sealed class FileSystemNode : INotifyPropertyChanged
                 return false;
             }
 
+            //NotificationCounter++;
+            //if (NotificationCounter < CounterSize)
+            //{
+            //    return true;
+            //}
+
             field = value;
+            Logger.Log($"PropertyChanged: {Path} {propertyName} = {value}");
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
 
             // Derived/calculated display properties also need to refresh when size changes.
