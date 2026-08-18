@@ -1,6 +1,7 @@
 using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Diagnostics;
+using DiskSpaceTree.Data.Persistence;
 using DiskSpaceTree.Models;
 using DiskSpaceTree.Services;
 
@@ -18,6 +19,7 @@ public partial class MainForm : Form
     private readonly TreeView _treeView;
     private readonly DataGridView _topDirectoriesGrid;
     private FileSystemNode? _rootNode;
+    private DateTime _scanStartedAt;
     private readonly ComboBox _driveComboBox;
     private readonly Button _scanButton;
     private readonly Button _cancelButton;
@@ -26,6 +28,7 @@ public partial class MainForm : Form
     private readonly System.Windows.Forms.Timer _updateTimer;
     private readonly HashSet<FileSystemNode> _dirtyNodes = [];
     private readonly Dictionary<FileSystemNode, TreeNode> _nodeMap = [];
+    private readonly HashSet<FileSystemNode> _subscribedNodes = [];
     private readonly TabControl _tabControl;
     private readonly TabPage _treeTabPage;
     private readonly TabPage _topDirectoriesTabPage;
@@ -307,6 +310,7 @@ public partial class MainForm : Form
         try
         {
             // Run the scan on a thread-pool thread so the WinForms UI thread stays responsive.
+            _scanStartedAt = DateTime.UtcNow;
             await Task.Run(() => _scanner.ScanDriveAsync(driveNode, progress, _cancellationTokenSource.Token), _cancellationTokenSource.Token);
             _statusLabel.Text = $"Scan complete. {driveNode.DisplaySize} total.";
         }
@@ -320,7 +324,25 @@ public partial class MainForm : Form
         }
         finally
         {
-            // Even when the scan is stopped early, generate the summary from whatever was scanned so far.
+            // Persist scan results in the background (fire-and-forget).
+            if (_rootNode is not null)
+            {
+                var capturedRoot = _rootNode;
+                var capturedStartedAt = _scanStartedAt;
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        var persistence = new ScanPersistenceService();
+                        await persistence.SaveScanResultsAsync(capturedRoot, capturedStartedAt);
+                    }
+                    catch
+                    {
+                        // Persistence failures are non-fatal; do not crash the app.
+                    }
+                });
+            }
+
             PopulateTopDirectories();
             IsBusy = false;
             _cancellationTokenSource?.Dispose();
@@ -446,6 +468,11 @@ public partial class MainForm : Form
 
     private void SubscribeToNode(FileSystemNode node, TreeNode treeNode)
     {
+        if (!_subscribedNodes.Add(node))
+        {
+            return;
+        }
+
         node.PropertyChanged += (s, e) =>
         {
             switch (e.PropertyName)
@@ -470,9 +497,16 @@ public partial class MainForm : Form
 
         foreach (var child in children)
         {
-            var childTreeNode = CreateTreeNode(child);
-            treeNode.Nodes.Add(childTreeNode);
-            SubscribeToNode(child, childTreeNode);
+            if (_nodeMap.TryGetValue(child, out var existingChildNode))
+            {
+                treeNode.Nodes.Add(existingChildNode);
+            }
+            else
+            {
+                var childTreeNode = CreateTreeNode(child);
+                treeNode.Nodes.Add(childTreeNode);
+                SubscribeToNode(child, childTreeNode);
+            }
         }
     }
 
@@ -510,8 +544,13 @@ public partial class MainForm : Form
                             SubscribeToNode(child, childTreeNode);
                         }
 
-                        parentTreeNode.Nodes.Insert(index, childTreeNode);
-                        index++;
+                        // A preceding Reset may have already rebuilt this branch with the
+                        // same tree nodes, so skip anything that is already attached.
+                        if (!parentTreeNode.Nodes.Contains(childTreeNode))
+                        {
+                            parentTreeNode.Nodes.Insert(index, childTreeNode);
+                            index++;
+                        }
                     }
 
                     UpdateTreeNode(parentTreeNode, parentNode);
@@ -538,15 +577,31 @@ public partial class MainForm : Form
                     resetChildren = parentNode.Children.ToList();
                 }
 
-                parentTreeNode.Nodes.Clear();
-                foreach (var child in resetChildren)
+                // Batch the rebuild so the TreeView does not lay out/paint for every node.
+                _treeView.BeginUpdate();
+                try
                 {
-                    var childTreeNode = CreateTreeNode(child);
-                    parentTreeNode.Nodes.Add(childTreeNode);
-                    SubscribeToNode(child, childTreeNode);
-                }
+                    parentTreeNode.Nodes.Clear();
+                    foreach (var child in resetChildren)
+                    {
+                        // Reuse the existing tree node so the same instance is not attached
+                        // twice and event subscriptions are not duplicated.
+                        if (!_nodeMap.TryGetValue(child, out var childTreeNode))
+                        {
+                            childTreeNode = CreateTreeNode(child);
+                            SubscribeToNode(child, childTreeNode);
+                        }
 
-                UpdateTreeNode(parentTreeNode, parentNode);
+                        parentTreeNode.Nodes.Add(childTreeNode);
+                        UpdateTreeNode(childTreeNode, child);
+                    }
+
+                    UpdateTreeNode(parentTreeNode, parentNode);
+                }
+                finally
+                {
+                    _treeView.EndUpdate();
+                }
                 break;
         }
     }

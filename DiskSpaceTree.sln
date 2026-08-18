@@ -9,6 +9,14 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DiskSpaceTree.Tests", "Disk
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DiskSpaceTree.WinForms", "DiskSpaceTree.WinForms\DiskSpaceTree.WinForms.csproj", "{53E73E39-E8FF-4FC3-8132-3627C930F1E1}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DiskSpaceTree.Data", "DiskSpaceTree.Data\DiskSpaceTree.Data.csproj", "{7B859147-F7BC-4278-9DDF-7DDFE24D6F45}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "NewFolder1", "NewFolder1", "{01EED90A-5B8E-4377-BE8F-EF32B83E2DCA}"
+	ProjectSection(SolutionItems) = preProject
+		AGENTS.md = AGENTS.md
+		Documents\Change List.md = Documents\Change List.md
+	EndProjectSection
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -27,6 +35,10 @@ Global
 		{53E73E39-E8FF-4FC3-8132-3627C930F1E1}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{53E73E39-E8FF-4FC3-8132-3627C930F1E1}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{53E73E39-E8FF-4FC3-8132-3627C930F1E1}.Release|Any CPU.Build.0 = Release|Any CPU
+		{7B859147-F7BC-4278-9DDF-7DDFE24D6F45}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{7B859147-F7BC-4278-9DDF-7DDFE24D6F45}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{7B859147-F7BC-4278-9DDF-7DDFE24D6F45}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{7B859147-F7BC-4278-9DDF-7DDFE24D6F45}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

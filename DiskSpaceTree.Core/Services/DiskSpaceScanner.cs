@@ -7,7 +7,7 @@ namespace DiskSpaceTree.Services;
 public sealed class DiskSpaceScanner
 {
     /// <summary>Upper limit on the number of directories whose files get scanned.</summary>
-    public const int DefaultMaxDirectoriesToScan = 30000000;
+    public const int DefaultMaxDirectoriesToScan = 100000000;
     public const int DirectoryScanTaskDepth = 4;
 
     private readonly IFileSystemAccessor _fileSystemAccessor;
@@ -16,6 +16,7 @@ public sealed class DiskSpaceScanner
     private readonly object _sortedDirectoriesLock = new();
     private List<FileSystemNode> _sortedDirectories = [];
     private readonly ConcurrentBag<Task> _listingTasks = new();
+    private readonly ConcurrentQueue<FileSystemNode> _directoryQueue = new();
     private long _filesProcessed;
     private ScanStage _currentStage;
 
@@ -84,6 +85,11 @@ public sealed class DiskSpaceScanner
     {
         _foundDirectories.Clear();
         _scannedDirectories.Clear();
+        while (!_directoryQueue.IsEmpty)
+        {
+            _directoryQueue.TryDequeue(out _);
+        }
+
         while (!_listingTasks.IsEmpty)
         {
             _listingTasks.TryTake(out _);
@@ -115,94 +121,32 @@ public sealed class DiskSpaceScanner
 
         progress?.Report(new ScanStatus(node.Path, _filesProcessed, ScanStage.ListingDirectories, DirectoriesFound, DirectoriesScanned));
 
-        // Stage 2: scan the files in every discovered directory and accumulate sizes.
+        // Stage 2: start a background task that drains the queue of every discovered
+        // directory, updating each directory's direct totals and pushing them up to all
+        // of its parents so the whole tree accumulates sizes and file counts.
         _currentStage = ScanStage.ScanningFiles;
-        await ScanFilesAsync(node, progress, cancellationToken, isRoot: true);
+        var scanTask = Task.Run(() => DrainDirectoryQueueAsync(progress, cancellationToken), cancellationToken);
+        await scanTask;
     }
 
-    private async Task<long> BuildDirectoryListAsync(FileSystemNode node, IProgress<ScanStatus>? progress,
-        CancellationToken cancellationToken, int depth)
+    private async Task DrainDirectoryQueueAsync(IProgress<ScanStatus>? progress, CancellationToken cancellationToken)
     {
-        cancellationToken.ThrowIfCancellationRequested();
-
-        if (_foundDirectories.Count >= MaxDirectoriesToScan)
-        {
-            return _foundDirectories.Count;
-        }
-
-        Logger.Log($"List start: {node.Path}");
-
-        // This node itself is a directory being scanned.
-        _foundDirectories[node.Path] = node;
-
-        List<string> directories;
-        try
-        {
-            directories = _fileSystemAccessor.EnumerateDirectories(node.Path).ToList();
-        }
-        catch (Exception ex) when (ex is UnauthorizedAccessException or PathTooLongException or DirectoryNotFoundException)
-        {
-            node.HasError = true;
-            node.ErrorMessage = ex.Message;
-            Logger.Log($"Directory list error: {node.Path} -> {ex.GetType().Name}: {ex.Message}");
-            return 1;
-        }
-
-        // At the fan-out level, dispatch a task per subdirectory without waiting on them.
-        // The walker keeps moving to the next sibling, so it never blocks on the subtrees.
-        var dispatchTasks = depth >= DirectoryScanTaskDepth;
-
-        // Down to the fan-out level, walk level by level; the count limit is then
-        // respected because each child fills its found slot before the next is added.
-        foreach (var directory in directories)
+        while (_directoryQueue.TryDequeue(out var node))
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            if (_foundDirectories.Count >= MaxDirectoriesToScan)
+            if (node.Parent is not null && _scannedDirectories.Count >= MaxDirectoriesToScan)
             {
                 break;
             }
 
-            var childName = System.IO.Path.GetFileName(directory);
-            var childNode = new FileSystemNode(childName, directory, isDirectory: true)
-            {
-                Parent = node
-            };
-
-            lock (node.SyncRoot)
-            {
-                node.Children.Add(childNode);
-            }
-
-            if (_foundDirectories.Count % 100 == 0)
-            {
-                progress?.Report(new ScanStatus(string.Empty, _filesProcessed, ScanStage.ListingDirectories, DirectoriesFound, DirectoriesScanned));
-            }
-
-            if (dispatchTasks)
-            {
-                _listingTasks.Add(Task.Run(() => 
-                        BuildDirectoryListAsync(childNode, progress, 
-                            cancellationToken, depth + 1), cancellationToken));
-            }
-            else
-            {
-                await BuildDirectoryListAsync(childNode, progress, cancellationToken, depth + 1);
-            }
+            await ScanSingleDirectoryAsync(node, progress, cancellationToken);
         }
-
-        Logger.Log($"List complete: {node.Path} -> {_foundDirectories.Count} directories total");
-        return _foundDirectories.Count;
     }
 
-    private async Task ScanFilesAsync(FileSystemNode node, IProgress<ScanStatus>? progress, CancellationToken cancellationToken, bool isRoot)
+    private Task ScanSingleDirectoryAsync(FileSystemNode node, IProgress<ScanStatus>? progress, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-
-        if (!isRoot && _scannedDirectories.Count >= MaxDirectoriesToScan)
-        {
-            return;
-        }
 
         Logger.Log($"Scan start: {node.Path}");
 
@@ -241,14 +185,18 @@ public sealed class DiskSpaceScanner
 
         Logger.Log($"Files scanned: {node.Path} -> {sizeInBytes} bytes / {fileCount} files");
 
-        // Direct totals (files in this directory only, excluding subdirectories) are the
-        // value before any child accumulation.
+        // Direct totals (files in this directory only, excluding subdirectories).
         node.DirectSizeInKb = ConvertToKilobytes(sizeInBytes);
         node.DirectFileCount = fileCount;
 
-        // Record this directory as having its files scanned (the root is the entry point,
-        // not a "found" subdirectory, so it is excluded from the scanned count).
-        if (!isRoot)
+        // This directory's direct totals flow into its own recursive totals and into
+        // every ancestor so parents accumulate the size and file count of all their
+        // subdirectories.
+        AccumulateToSelfAndAncestors(node, node.DirectSizeInKb, node.DirectFileCount);
+
+        // Record this directory as having its files scanned (the root is the entry
+        // point, not a "found" subdirectory, so it is excluded from the scanned count).
+        if (node.Parent is not null)
         {
             var existing = _scannedDirectories.TryAdd(node.Path, node);
             lock (_sortedDirectoriesLock)
@@ -266,32 +214,6 @@ public sealed class DiskSpaceScanner
             }
         }
 
-        List<FileSystemNode> children;
-        lock (node.SyncRoot)
-        {
-            children = node.Children.ToList();
-        }
-
-        foreach (var childNode in children)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            await ScanFilesAsync(childNode, progress, cancellationToken, isRoot: false);
-            sizeInBytes += childNode.SizeInKb * 1024;
-            fileCount += childNode.FileCount;
-
-            lock (node.SyncRoot)
-            {
-                node.Children.Remove(childNode);
-                InsertChildSorted(node, childNode);
-            }
-        }
-
-        node.SizeInKb = ConvertToKilobytes(sizeInBytes);
-        node.FileCount = fileCount;
-        Logger.Log($"Scan complete: {node.Path} -> {node.SizeInKb} KB / {node.FileCount} files");
-        node.RaiseEvent();
-
         var scanned = DirectoriesScanned;
         if (scanned % 50 == 0 && scanned > 0)
         {
@@ -299,6 +221,113 @@ public sealed class DiskSpaceScanner
         }
 
         DirectoryCompleted?.Invoke(this, node);
+
+        // Once the last child of a directory finishes, its subtree is complete and its
+        // children can be ordered by their (now final) sizes.
+        var parent = node.Parent;
+        if (parent is not null && Interlocked.Decrement(ref parent.PendingChildCount) == 0)
+        {
+            SortChildrenBySizeDescending(parent);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private static void AccumulateToSelfAndAncestors(FileSystemNode node, long sizeInKb, long fileCount)
+    {
+        var current = node;
+        while (current is not null)
+        {
+            current.AddSizeInKb(sizeInKb);
+            current.AddFileCount(fileCount);
+            current = current.Parent;
+        }
+    }
+
+    private static void SortChildrenBySizeDescending(FileSystemNode parent)
+    {
+        lock (parent.SyncRoot)
+        {
+            var sorted = parent.Children.OrderByDescending(child => child.SizeInKb).ToList();
+            parent.Children.ReplaceWith(sorted);
+        }
+    }
+
+    private async Task<long> BuildDirectoryListAsync(FileSystemNode node, IProgress<ScanStatus>? progress,
+        CancellationToken cancellationToken, int depth)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        if (_foundDirectories.Count >= MaxDirectoriesToScan)
+        {
+            return _foundDirectories.Count;
+        }
+
+        Logger.Log($"List start: {node.Path}");
+
+        // This node itself is a directory being scanned.
+        _foundDirectories[node.Path] = node;
+        _directoryQueue.Enqueue(node);
+
+        List<string> directories;
+        try
+        {
+            directories = _fileSystemAccessor.EnumerateDirectories(node.Path).ToList();
+        }
+        catch (Exception ex) when (ex is UnauthorizedAccessException or PathTooLongException or DirectoryNotFoundException)
+        {
+            node.HasError = true;
+            node.ErrorMessage = ex.Message;
+            Logger.Log($"Directory list error: {node.Path} -> {ex.GetType().Name}: {ex.Message}");
+            return 1;
+        }
+
+        // At the fan-out level, dispatch a task per subdirectory without waiting on them.
+        // The walker keeps moving to the next sibling, so it never blocks on the subtrees.
+        var dispatchTasks = depth >= DirectoryScanTaskDepth;
+
+        // Down to the fan-out level, walk level by level; the count limit is then
+        // respected because each child fills its found slot before the next is added.
+        foreach (var directory in directories)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (_foundDirectories.Count >= MaxDirectoriesToScan)
+            {
+                break;
+            }
+
+            var childName = System.IO.Path.GetFileName(directory);
+            var childNode = new FileSystemNode(childName, directory, isDirectory: true)
+            {
+                Parent = node
+            };
+
+            lock (node.SyncRoot)
+            {
+                node.Children.Add(childNode);
+                node.PendingChildCount++;
+            }
+
+            if (_foundDirectories.Count % 100 == 0)
+            {
+                progress?.Report(new ScanStatus(string.Empty, _filesProcessed, ScanStage.ListingDirectories, DirectoriesFound, DirectoriesScanned));
+            }
+
+            if (dispatchTasks)
+            {
+                _listingTasks.Add(Task.Run(() => 
+                        BuildDirectoryListAsync(childNode, progress, 
+                            cancellationToken, depth + 1), cancellationToken));
+            }
+            else
+            {
+                await BuildDirectoryListAsync(childNode, progress, cancellationToken, depth + 1);
+            }
+        }
+
+        Logger.Log($"List complete: {node.Path} -> {_foundDirectories.Count} directories total");
+        return _foundDirectories.Count;
     }
 
     private static int CompareDirectoriesBySizeDescending(FileSystemNode? x, FileSystemNode? y)
@@ -309,17 +338,6 @@ public sealed class DiskSpaceScanner
     private static long ConvertToKilobytes(long bytes)
     {
         return (bytes + 1023) / 1024;
-    }
-
-    private static void InsertChildSorted(FileSystemNode parent, FileSystemNode child)
-    {
-        var index = 0;
-        while (index < parent.Children.Count && parent.Children[index].SizeInKb > child.SizeInKb)
-        {
-            index++;
-        }
-
-        parent.Children.Insert(index, child);
     }
 
 }

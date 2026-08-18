@@ -1,9 +1,48 @@
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Runtime.CompilerServices;
 using DiskSpaceTree.Diagnostics;
 
 namespace DiskSpaceTree.Models;
+
+/// <summary>
+/// An <see cref="ObservableCollection{T}"/> that supports suppressing change
+/// notifications while a batch mutation (e.g. a size-based re-sort of children)
+/// is being applied, then raising a single <see cref="NotifyCollectionChangedAction.Reset"/>.
+/// This prevents flooding subscribers with one event per child.
+/// </summary>
+public sealed class ObservableChildCollection : ObservableCollection<FileSystemNode>
+{
+    private bool _suppress;
+
+    protected override void OnCollectionChanged(NotifyCollectionChangedEventArgs e)
+    {
+        if (!_suppress)
+        {
+            base.OnCollectionChanged(e);
+        }
+    }
+
+    public void ReplaceWith(IList<FileSystemNode> sorted)
+    {
+        _suppress = true;
+        try
+        {
+            Clear();
+            foreach (var child in sorted)
+            {
+                Add(child);
+            }
+        }
+        finally
+        {
+            _suppress = false;
+        }
+
+        OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
+    }
+}
 
 public sealed class FileSystemNode : INotifyPropertyChanged
 {
@@ -21,7 +60,7 @@ public sealed class FileSystemNode : INotifyPropertyChanged
         Name = name ?? throw new ArgumentNullException(nameof(name));
         Path = path ?? throw new ArgumentNullException(nameof(path));
         IsDirectory = isDirectory;
-        Children = new ObservableCollection<FileSystemNode>();
+        Children = new ObservableChildCollection();
     }
 
     public string Name { get; }
@@ -32,7 +71,10 @@ public sealed class FileSystemNode : INotifyPropertyChanged
 
     public FileSystemNode? Parent { get; internal set; }
 
-    public ObservableCollection<FileSystemNode> Children { get; }
+    public ObservableChildCollection Children { get; }
+
+    /// <summary>Number of child directories that have not finished scanning yet.</summary>
+    public int PendingChildCount;
 
     public long SizeInKb
     {
@@ -50,6 +92,38 @@ public sealed class FileSystemNode : INotifyPropertyChanged
     public long DirectSizeInKb { get; internal set; }
 
     public long DirectFileCount { get; internal set; }
+
+    // Adds the given totals to this node and raises the property-change notifications
+    // so the UI can refresh. Thread-safe for the concurrent scan workers.
+    public void AddSizeInKb(long amount)
+    {
+        if (amount == 0)
+        {
+            return;
+        }
+
+        lock (SyncRoot)
+        {
+            _sizeInKb += amount;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(SizeInKb)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(DisplaySize)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(DisplayText)));
+        }
+    }
+
+    public void AddFileCount(long count)
+    {
+        if (count == 0)
+        {
+            return;
+        }
+
+        lock (SyncRoot)
+        {
+            _fileCount += count;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(FileCount)));
+        }
+    }
 
     public bool IsExpanded
     {
