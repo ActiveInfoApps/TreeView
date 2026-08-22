@@ -32,6 +32,11 @@ public partial class MainForm : Form
     private readonly TabControl _tabControl;
     private readonly TabPage _treeTabPage;
     private readonly TabPage _topDirectoriesTabPage;
+    private readonly TabPage _sizeChangesTabPage;
+    private readonly DataGridView _sizeChangesGrid;
+    private readonly ComboBox _currentExecCombo;
+    private readonly ComboBox _previousExecCombo;
+    private List<Data.Persistence.ExecutionDto> _executions = [];
     private long _directoriesScannedCount;
     private string _topDirectoriesHash = string.Empty;
 
@@ -117,6 +122,9 @@ public partial class MainForm : Form
             Dock = DockStyle.Fill,
             ShowNodeToolTips = true
         };
+        typeof(Control).GetProperty("DoubleBuffered",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            ?.SetValue(_treeView, true);
         _treeView.NodeMouseClick += TreeView_NodeMouseClick;
         _treeView.BeforeExpand += TreeView_BeforeExpand;
 
@@ -152,6 +160,9 @@ public partial class MainForm : Form
             AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
             SelectionMode = DataGridViewSelectionMode.FullRowSelect
         };
+        typeof(Control).GetProperty("DoubleBuffered",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            ?.SetValue(_topDirectoriesGrid, true);
         _topDirectoriesGrid.CellDoubleClick += TopDirectoriesGrid_CellDoubleClick;
 
         _topDirectoriesGrid.Columns.Add(new DataGridViewTextBoxColumn
@@ -201,9 +212,167 @@ public partial class MainForm : Form
         _topDirectoriesTabPage.Controls.Add(_topDirectoriesGrid);
         _topDirectoriesTabPage.Controls.Add(topHintLabel);
 
+        _sizeChangesGrid = new DataGridView
+        {
+            Dock = DockStyle.Fill,
+            ReadOnly = true,
+            AllowUserToAddRows = false,
+            AllowUserToDeleteRows = false,
+            AllowUserToResizeRows = false,
+            RowHeadersVisible = false,
+            AutoGenerateColumns = false,
+            AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+            SelectionMode = DataGridViewSelectionMode.FullRowSelect
+        };
+        typeof(Control).GetProperty("DoubleBuffered",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            ?.SetValue(_sizeChangesGrid, true);
+        _sizeChangesGrid.CellDoubleClick += SizeChangesGrid_CellDoubleClick;
+
+        _sizeChangesGrid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = "Name",
+            DataPropertyName = "Name",
+            FillWeight = 20,
+            ReadOnly = true
+        });
+        _sizeChangesGrid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = "Full Path",
+            DataPropertyName = "Path",
+            FillWeight = 30,
+            ReadOnly = true
+        });
+        _sizeChangesGrid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = "Prev Size",
+            DataPropertyName = "PreviousSizeInKb",
+            FillWeight = 10,
+            ReadOnly = true,
+            DefaultCellStyle = { Format = "N0", Alignment = DataGridViewContentAlignment.MiddleRight }
+        });
+        _sizeChangesGrid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = "Prev Files",
+            DataPropertyName = "PreviousFileCount",
+            FillWeight = 10,
+            ReadOnly = true,
+            DefaultCellStyle = { Format = "N0", Alignment = DataGridViewContentAlignment.MiddleRight }
+        });
+        _sizeChangesGrid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = "Current Size",
+            DataPropertyName = "CurrentSizeInKb",
+            FillWeight = 10,
+            ReadOnly = true,
+            DefaultCellStyle = { Format = "N0", Alignment = DataGridViewContentAlignment.MiddleRight }
+        });
+        _sizeChangesGrid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = "Current Files",
+            DataPropertyName = "CurrentFileCount",
+            FillWeight = 10,
+            ReadOnly = true,
+            DefaultCellStyle = { Format = "N0", Alignment = DataGridViewContentAlignment.MiddleRight }
+        });
+        _sizeChangesGrid.Columns.Add(new DataGridViewTextBoxColumn
+        {
+            HeaderText = "Change (KB)",
+            DataPropertyName = "SizeChangeInKb",
+            FillWeight = 10,
+            ReadOnly = true,
+            DefaultCellStyle = { Format = "N0", Alignment = DataGridViewContentAlignment.MiddleRight }
+        });
+
+        _sizeChangesTabPage = new TabPage("Size Changes") { Dock = DockStyle.Fill };
+
+        var sizeChangesTopPanel = new Panel
+        {
+            Dock = DockStyle.Top,
+            Height = 35
+        };
+
+        var currentExecLabel = new Label
+        {
+            Text = "Current:",
+            AutoSize = true,
+            Location = new Point(5, 10)
+        };
+        sizeChangesTopPanel.Controls.Add(currentExecLabel);
+
+        _currentExecCombo = new ComboBox
+        {
+            Width = 350,
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Location = new Point(60, 6)
+        };
+        _currentExecCombo.SelectedIndexChanged += ExecCombo_SelectedIndexChanged;
+        sizeChangesTopPanel.Controls.Add(_currentExecCombo);
+
+        var previousExecLabel = new Label
+        {
+            Text = "Compare to:",
+            AutoSize = true,
+            Location = new Point(430, 10)
+        };
+        sizeChangesTopPanel.Controls.Add(previousExecLabel);
+
+        _previousExecCombo = new ComboBox
+        {
+            Width = 350,
+            DropDownStyle = ComboBoxStyle.DropDownList,
+            Location = new Point(510, 6)
+        };
+        _previousExecCombo.SelectedIndexChanged += ExecCombo_SelectedIndexChanged;
+        sizeChangesTopPanel.Controls.Add(_previousExecCombo);
+
+        var reloadButton = new Button
+        {
+            Text = "Reload",
+            Width = 75,
+            Height = 23,
+            Location = new Point(880, 6)
+        };
+        reloadButton.Click += (_, _) => RefreshSizeChangesGrid();
+        sizeChangesTopPanel.Controls.Add(reloadButton);
+
+        var showDbButton = new Button
+        {
+            Text = "Show Database",
+            Width = 100,
+            Height = 23,
+            Location = new Point(960, 6)
+        };
+        showDbButton.Click += (_, _) =>
+        {
+            try
+            {
+                var dbDir = Path.Combine("C:", "TreeView", "Database");
+                Process.Start(new ProcessStartInfo("explorer.exe", $"\"{dbDir}\"") { UseShellExecute = true });
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Failed to open Explorer: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        };
+        sizeChangesTopPanel.Controls.Add(showDbButton);
+
+        var sizeChangesHintLabel = new Label
+        {
+            Text = "Double-click a row to open the directory in Explorer.",
+            Dock = DockStyle.Top,
+            AutoSize = true,
+            Padding = new Padding(5, 5, 5, 5),
+            Font = new Font(Font.FontFamily, Font.Size, FontStyle.Bold)
+        };
+        _sizeChangesTabPage.Controls.Add(_sizeChangesGrid);
+        _sizeChangesTabPage.Controls.Add(sizeChangesHintLabel);
+        _sizeChangesTabPage.Controls.Add(sizeChangesTopPanel);
+
         _tabControl = new TabControl { Dock = DockStyle.Fill };
         _tabControl.TabPages.Add(_treeTabPage);
         _tabControl.TabPages.Add(_topDirectoriesTabPage);
+        _tabControl.TabPages.Add(_sizeChangesTabPage);
 
         Controls.Add(_tabControl);
         Controls.Add(topPanel);
@@ -214,6 +383,30 @@ public partial class MainForm : Form
         _updateTimer.Start();
 
         LoadDrives();
+        _ = LoadInitialSizeChangesAsync();
+    }
+
+    private async Task LoadInitialSizeChangesAsync()
+    {
+        try
+        {
+            var persistence = new ScanPersistenceService();
+            var executions = await persistence.GetAllExecutionsAsync();
+            if (executions.Count == 0)
+                return;
+
+            LoadExecutions(executions);
+            if (executions.Count >= 2)
+            {
+                var changes = await persistence.GetChangedDirectoriesAsync(
+                    executions[0].Id, executions[1].Id, 50);
+                _sizeChangesGrid.DataSource = changes;
+            }
+        }
+        catch
+        {
+            // Non-fatal; tab stays empty.
+        }
     }
 
     private void UpdateTimer_Tick(object? sender, EventArgs e)
@@ -280,6 +473,9 @@ public partial class MainForm : Form
 
         _treeView.Nodes.Clear();
         _topDirectoriesGrid.DataSource = null;
+        _sizeChangesGrid.DataSource = null;
+        _currentExecCombo.DataSource = null;
+        _previousExecCombo.DataSource = null;
         _statusPathLabel.Text = string.Empty;
         _statusCountLabel.Text = "Files: 0";
         _statusLabel.Text = "Scanning...";
@@ -324,7 +520,7 @@ public partial class MainForm : Form
         }
         finally
         {
-            // Persist scan results in the background (fire-and-forget).
+            // Persist scan results in the background, then load executions and show changes.
             if (_rootNode is not null)
             {
                 var capturedRoot = _rootNode;
@@ -335,6 +531,12 @@ public partial class MainForm : Form
                     {
                         var persistence = new ScanPersistenceService();
                         await persistence.SaveScanResultsAsync(capturedRoot, capturedStartedAt);
+                        var executions = await persistence.GetAllExecutionsAsync();
+                        InvokeOnUiThread(() =>
+                        {
+                            LoadExecutions(executions);
+                            RefreshSizeChangesGrid();
+                        });
                     }
                     catch
                     {
@@ -429,6 +631,23 @@ public partial class MainForm : Form
         }
 
         OpenInExplorer(node);
+    }
+
+    private void SizeChangesGrid_CellDoubleClick(object? sender, DataGridViewCellEventArgs e)
+    {
+        if (e.RowIndex < 0 || _sizeChangesGrid.Rows[e.RowIndex].DataBoundItem is not Data.Persistence.DirectoryChangeDto dto)
+        {
+            return;
+        }
+
+        try
+        {
+            Process.Start(new ProcessStartInfo("explorer.exe", $"\"{dto.Path}\"") { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Failed to open Explorer: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 
     private static void OpenInExplorer(FileSystemNode node)
@@ -631,6 +850,82 @@ public partial class MainForm : Form
 
         _topDirectoriesHash = hash;
         _topDirectoriesGrid.DataSource = top;
+    }
+
+    private void LoadExecutions(List<Data.Persistence.ExecutionDto> executions)
+    {
+        _executions = executions;
+
+        // Detach the event handler while setting up to avoid premature refreshes.
+        _currentExecCombo.SelectedIndexChanged -= ExecCombo_SelectedIndexChanged;
+        _previousExecCombo.SelectedIndexChanged -= ExecCombo_SelectedIndexChanged;
+
+        // Give each combo its own list copy so they don't interfere with each other.
+        _currentExecCombo.DataSource = null;
+        _currentExecCombo.DataSource = new List<Data.Persistence.ExecutionDto>(_executions);
+        _currentExecCombo.DisplayMember = "DisplayText";
+        _currentExecCombo.ValueMember = "Id";
+
+        _previousExecCombo.DataSource = null;
+        _previousExecCombo.DataSource = new List<Data.Persistence.ExecutionDto>(_executions);
+        _previousExecCombo.DisplayMember = "DisplayText";
+        _previousExecCombo.ValueMember = "Id";
+
+        if (_executions.Count >= 1)
+            _currentExecCombo.SelectedIndex = 0;
+        if (_executions.Count >= 2)
+            _previousExecCombo.SelectedIndex = 1;
+
+        // Reattach after setup is complete.
+        _currentExecCombo.SelectedIndexChanged += ExecCombo_SelectedIndexChanged;
+        _previousExecCombo.SelectedIndexChanged += ExecCombo_SelectedIndexChanged;
+    }
+
+    private void ExecCombo_SelectedIndexChanged(object? sender, EventArgs e)
+    {
+        if (_currentExecCombo.SelectedItem is Data.Persistence.ExecutionDto &&
+            _previousExecCombo.SelectedItem is Data.Persistence.ExecutionDto)
+        {
+            RefreshSizeChangesGrid();
+        }
+    }
+
+    private void RefreshSizeChangesGrid()
+    {
+        if (_currentExecCombo.SelectedItem is not Data.Persistence.ExecutionDto current ||
+            _previousExecCombo.SelectedItem is not Data.Persistence.ExecutionDto previous)
+        {
+            return;
+        }
+
+        if (current.Id == previous.Id)
+        {
+            _sizeChangesGrid.DataSource = new List<Data.Persistence.DirectoryChangeDto>();
+            return;
+        }
+
+        _ = LoadChangesAsync(current.Id, previous.Id);
+    }
+
+    private async Task LoadChangesAsync(Guid currentId, Guid previousId)
+    {
+        try
+        {
+            var persistence = new ScanPersistenceService();
+            var changes = await persistence.GetChangedDirectoriesAsync(currentId, previousId, 50);
+            InvokeOnUiThread(() =>
+            {
+                _sizeChangesGrid.DataSource = changes;
+                if (changes.Count > 0)
+                {
+                    _tabControl.SelectedTab = _sizeChangesTabPage;
+                }
+            });
+        }
+        catch
+        {
+            // Non-fatal; grid stays empty.
+        }
     }
 
     private static string ComputeDirectoryHash(IReadOnlyList<FileSystemNode> directories)
