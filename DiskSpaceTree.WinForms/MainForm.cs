@@ -1,4 +1,4 @@
-using System.Collections.Specialized;
+using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Diagnostics;
 using DiskSpaceTree.Data.Persistence;
@@ -26,14 +26,13 @@ public partial class MainForm : Form
     private readonly Label _statusLabel;
     private readonly ProgressBar _progressBar;
     private readonly System.Windows.Forms.Timer _updateTimer;
-    private readonly HashSet<FileSystemNode> _dirtyNodes = [];
-    private readonly Dictionary<FileSystemNode, TreeNode> _nodeMap = [];
-    private readonly HashSet<FileSystemNode> _subscribedNodes = [];
+    private readonly ConcurrentQueue<FileSystemNode> _treeUpdateQueue = new();
     private readonly TabControl _tabControl;
     private readonly TabPage _treeTabPage;
     private readonly TabPage _topDirectoriesTabPage;
     private readonly TabPage _sizeChangesTabPage;
     private readonly DataGridView _sizeChangesGrid;
+    private readonly Label _scanNameLabel;
     private readonly ComboBox _currentExecCombo;
     private readonly ComboBox _previousExecCombo;
     private List<Data.Persistence.ExecutionDto> _executions = [];
@@ -43,7 +42,6 @@ public partial class MainForm : Form
     public MainForm()
     {
         _scanner = new DiskSpaceScanner(new FileSystemAccessor());
-        _scanner.DirectoryCompleted += Scanner_DirectoryCompleted;
 
         Text = "Disk Space Tree";
         Size = new Size(900, 600);
@@ -284,6 +282,15 @@ public partial class MainForm : Form
             DefaultCellStyle = { Format = "N0", Alignment = DataGridViewContentAlignment.MiddleRight }
         });
 
+        _scanNameLabel = new Label
+        {
+            Dock = DockStyle.Top,
+            Height = 20,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Padding = new Padding(5, 0, 0, 0),
+            Font = new Font(Font.FontFamily, Font.Size, FontStyle.Bold)
+        };
+
         _sizeChangesTabPage = new TabPage("Size Changes") { Dock = DockStyle.Fill };
 
         var sizeChangesTopPanel = new Panel
@@ -302,7 +309,7 @@ public partial class MainForm : Form
 
         _currentExecCombo = new ComboBox
         {
-            Width = 350,
+            Width = 250,
             DropDownStyle = ComboBoxStyle.DropDownList,
             Location = new Point(60, 6)
         };
@@ -313,15 +320,15 @@ public partial class MainForm : Form
         {
             Text = "Compare to:",
             AutoSize = true,
-            Location = new Point(430, 10)
+            Location = new Point(330, 10)
         };
         sizeChangesTopPanel.Controls.Add(previousExecLabel);
 
         _previousExecCombo = new ComboBox
         {
-            Width = 350,
+            Width = 250,
             DropDownStyle = ComboBoxStyle.DropDownList,
-            Location = new Point(510, 6)
+            Location = new Point(410, 6)
         };
         _previousExecCombo.SelectedIndexChanged += ExecCombo_SelectedIndexChanged;
         sizeChangesTopPanel.Controls.Add(_previousExecCombo);
@@ -331,7 +338,7 @@ public partial class MainForm : Form
             Text = "Reload",
             Width = 75,
             Height = 23,
-            Location = new Point(880, 6)
+            Location = new Point(680, 6)
         };
         reloadButton.Click += (_, _) => RefreshSizeChangesGrid();
         sizeChangesTopPanel.Controls.Add(reloadButton);
@@ -341,7 +348,7 @@ public partial class MainForm : Form
             Text = "Show Database",
             Width = 100,
             Height = 23,
-            Location = new Point(960, 6)
+            Location = new Point(760, 6)
         };
         showDbButton.Click += (_, _) =>
         {
@@ -366,6 +373,7 @@ public partial class MainForm : Form
             Font = new Font(Font.FontFamily, Font.Size, FontStyle.Bold)
         };
         _sizeChangesTabPage.Controls.Add(_sizeChangesGrid);
+        _sizeChangesTabPage.Controls.Add(_scanNameLabel);
         _sizeChangesTabPage.Controls.Add(sizeChangesHintLabel);
         _sizeChangesTabPage.Controls.Add(sizeChangesTopPanel);
 
@@ -398,9 +406,7 @@ public partial class MainForm : Form
             LoadExecutions(executions);
             if (executions.Count >= 2)
             {
-                var changes = await persistence.GetChangedDirectoriesAsync(
-                    executions[0].Id, executions[1].Id, 50);
-                _sizeChangesGrid.DataSource = changes;
+                RefreshSizeChangesGrid();
             }
         }
         catch
@@ -411,30 +417,51 @@ public partial class MainForm : Form
 
     private void UpdateTimer_Tick(object? sender, EventArgs e)
     {
+        ProcessTreeQueue();
+
+        if (_rootNode != null)
+        {
+            _statusTotalSizeLabel.Text = $"Total: {_rootNode.DisplaySize}";
+        }
+    }
+
+    private void ProcessTreeQueue()
+    {
+        if (_treeUpdateQueue.IsEmpty)
+            return;
+
         _treeView.BeginUpdate();
         try
         {
-            lock (_dirtyNodes)
+            while (_treeUpdateQueue.TryDequeue(out var node))
             {
-                foreach (var node in _dirtyNodes)
+                if (node.TreeNode is DisplayTreeNode existingNode)
                 {
-                    if (_nodeMap.TryGetValue(node, out var treeNode))
+                    // Only update if the displayed text actually changed.
+                    var newText = node.DisplayText;
+                    if (existingNode.Text != newText)
                     {
-                        UpdateTreeNode(treeNode, node);
+                        existingNode.DisplayText = newText;
+                    }
+
+                    existingNode.ForeColor = node.HasError ? Color.Red : SystemColors.WindowText;
+                }
+                else
+                {
+                    // First pass: node is new — create its tree node and attach to parent.
+                    var treeNode = new DisplayTreeNode(node.DisplayText, node.Path);
+                    node.TreeNode = treeNode;
+
+                    if (node.Parent?.TreeNode is DisplayTreeNode parentTreeNode)
+                    {
+                        parentTreeNode.Nodes.Add(treeNode);
                     }
                 }
-
-                _dirtyNodes.Clear();
             }
         }
         finally
         {
             _treeView.EndUpdate();
-        }
-
-        if (_rootNode != null)
-        {
-            _statusTotalSizeLabel.Text = $"Total: {_rootNode.DisplaySize}";
         }
     }
 
@@ -480,10 +507,19 @@ public partial class MainForm : Form
         _statusCountLabel.Text = "Files: 0";
         _statusLabel.Text = "Scanning...";
 
-        var rootTreeNode = CreateTreeNode(driveNode);
-        _treeView.Nodes.Add(rootTreeNode);
-        SubscribeToNode(driveNode, rootTreeNode);
-        rootTreeNode.Expand();
+        // Drain any stale items from a previous scan.
+        while (_treeUpdateQueue.TryDequeue(out _)) { }
+
+        // Create the root tree node and link it.
+        var rootDisplayNode = new DisplayTreeNode(driveNode.DisplayText, driveNode.Path);
+        driveNode.TreeNode = rootDisplayNode;
+        _treeView.Nodes.Add(rootDisplayNode);
+        rootDisplayNode.Expand();
+
+        // Subscribe to scanner events — they enqueue nodes for the UI thread.
+        _scanner.DirectoryDiscovered += Scanner_DirectoryDiscovered;
+        _scanner.DirectoryCompleted += Scanner_DirectoryCompleted;
+        _scanner.AncestorUpdated += Scanner_AncestorUpdated;
 
         var progress = new Progress<ScanStatus>(status =>
         {
@@ -520,6 +556,10 @@ public partial class MainForm : Form
         }
         finally
         {
+            _scanner.DirectoryDiscovered -= Scanner_DirectoryDiscovered;
+            _scanner.DirectoryCompleted -= Scanner_DirectoryCompleted;
+            _scanner.AncestorUpdated -= Scanner_AncestorUpdated;
+
             // Persist scan results in the background, then load executions and show changes.
             if (_rootNode is not null)
             {
@@ -557,12 +597,14 @@ public partial class MainForm : Form
         _cancellationTokenSource?.Cancel();
     }
 
+    private void Scanner_DirectoryDiscovered(object? sender, FileSystemNode node)
+    {
+        _treeUpdateQueue.Enqueue(node);
+    }
+
     private void Scanner_DirectoryCompleted(object? sender, FileSystemNode node)
     {
-        if (_rootNode is null)
-        {
-            return;
-        }
+        _treeUpdateQueue.Enqueue(node);
 
         var completed = Interlocked.Increment(ref _directoriesScannedCount);
         if (completed % 100 != 0)
@@ -571,6 +613,11 @@ public partial class MainForm : Form
         }
 
         InvokeOnUiThread(PopulateTopDirectories);
+    }
+
+    private void Scanner_AncestorUpdated(object? sender, FileSystemNode node)
+    {
+        _treeUpdateQueue.Enqueue(node);
     }
 
     private bool IsBusy
@@ -662,169 +709,6 @@ public partial class MainForm : Form
         }
     }
 
-    private TreeNode CreateTreeNode(FileSystemNode node)
-    {
-        var treeNode = new TreeNode(node.DisplayText)
-        {
-            Tag = node,
-            ToolTipText = node.Path
-        };
-
-        if (node.HasError)
-        {
-            treeNode.ForeColor = Color.Red;
-        }
-
-        _nodeMap[node] = treeNode;
-        return treeNode;
-    }
-
-    private void UpdateTreeNode(TreeNode treeNode, FileSystemNode node)
-    {
-        treeNode.Text = node.DisplayText;
-        treeNode.ForeColor = node.HasError ? Color.Red : SystemColors.WindowText;
-    }
-
-    private void SubscribeToNode(FileSystemNode node, TreeNode treeNode)
-    {
-        if (!_subscribedNodes.Add(node))
-        {
-            return;
-        }
-
-        node.PropertyChanged += (s, e) =>
-        {
-            switch (e.PropertyName)
-            {
-                case nameof(FileSystemNode.SizeInKb):
-                case nameof(FileSystemNode.HasError):
-                    MarkNodeDirty(node);
-                    break;
-            }
-        };
-
-        node.Children.CollectionChanged += (s, e) =>
-        {
-            InvokeOnUiThread(() => HandleChildrenChanged(treeNode, node, e));
-        };
-
-        List<FileSystemNode> children;
-        lock (node.SyncRoot)
-        {
-            children = node.Children.ToList();
-        }
-
-        foreach (var child in children)
-        {
-            if (_nodeMap.TryGetValue(child, out var existingChildNode))
-            {
-                treeNode.Nodes.Add(existingChildNode);
-            }
-            else
-            {
-                var childTreeNode = CreateTreeNode(child);
-                treeNode.Nodes.Add(childTreeNode);
-                SubscribeToNode(child, childTreeNode);
-            }
-        }
-    }
-
-    private void MarkNodeDirty(FileSystemNode node)
-    {
-        lock (_dirtyNodes)
-        {
-            _dirtyNodes.Add(node);
-        }
-    }
-
-    private void HandleChildrenChanged(TreeNode parentTreeNode, FileSystemNode parentNode, NotifyCollectionChangedEventArgs e)
-    {
-        if (_scanner.CurrentStage == ScanStage.ListingDirectories)
-        {
-            return;
-        }
-
-        switch (e.Action)
-        {
-            case NotifyCollectionChangedAction.Add:
-                if (e.NewItems != null)
-                {
-                    var index = e.NewStartingIndex >= 0 ? e.NewStartingIndex : parentTreeNode.Nodes.Count;
-                    foreach (FileSystemNode child in e.NewItems)
-                    {
-                        TreeNode childTreeNode;
-                        if (_nodeMap.TryGetValue(child, out var existingNode))
-                        {
-                            childTreeNode = existingNode;
-                        }
-                        else
-                        {
-                            childTreeNode = CreateTreeNode(child);
-                            SubscribeToNode(child, childTreeNode);
-                        }
-
-                        // A preceding Reset may have already rebuilt this branch with the
-                        // same tree nodes, so skip anything that is already attached.
-                        if (!parentTreeNode.Nodes.Contains(childTreeNode))
-                        {
-                            parentTreeNode.Nodes.Insert(index, childTreeNode);
-                            index++;
-                        }
-                    }
-
-                    UpdateTreeNode(parentTreeNode, parentNode);
-                }
-                break;
-
-            case NotifyCollectionChangedAction.Remove:
-                if (e.OldItems != null)
-                {
-                    foreach (FileSystemNode child in e.OldItems)
-                    {
-                        if (_nodeMap.TryGetValue(child, out var childTreeNode))
-                        {
-                            parentTreeNode.Nodes.Remove(childTreeNode);
-                        }
-                    }
-                }
-                break;
-
-            case NotifyCollectionChangedAction.Reset:
-                List<FileSystemNode> resetChildren;
-                lock (parentNode.SyncRoot)
-                {
-                    resetChildren = parentNode.Children.ToList();
-                }
-
-                // Batch the rebuild so the TreeView does not lay out/paint for every node.
-                _treeView.BeginUpdate();
-                try
-                {
-                    parentTreeNode.Nodes.Clear();
-                    foreach (var child in resetChildren)
-                    {
-                        // Reuse the existing tree node so the same instance is not attached
-                        // twice and event subscriptions are not duplicated.
-                        if (!_nodeMap.TryGetValue(child, out var childTreeNode))
-                        {
-                            childTreeNode = CreateTreeNode(child);
-                            SubscribeToNode(child, childTreeNode);
-                        }
-
-                        parentTreeNode.Nodes.Add(childTreeNode);
-                        UpdateTreeNode(childTreeNode, child);
-                    }
-
-                    UpdateTreeNode(parentTreeNode, parentNode);
-                }
-                finally
-                {
-                    _treeView.EndUpdate();
-                }
-                break;
-        }
-    }
-
     private void InvokeOnUiThread(Action action)
     {
         if (InvokeRequired)
@@ -883,28 +767,27 @@ public partial class MainForm : Form
 
     private void ExecCombo_SelectedIndexChanged(object? sender, EventArgs e)
     {
-        if (_currentExecCombo.SelectedItem is Data.Persistence.ExecutionDto &&
-            _previousExecCombo.SelectedItem is Data.Persistence.ExecutionDto)
-        {
-            RefreshSizeChangesGrid();
-        }
+        RefreshSizeChangesGrid();
     }
 
-    private void RefreshSizeChangesGrid()
+    private async void RefreshSizeChangesGrid()
     {
-        if (_currentExecCombo.SelectedItem is not Data.Persistence.ExecutionDto current ||
-            _previousExecCombo.SelectedItem is not Data.Persistence.ExecutionDto previous)
+        if (_currentExecCombo.SelectedItem is not Data.Persistence.ExecutionDto current)
         {
             return;
         }
 
-        if (current.Id == previous.Id)
+        if (_previousExecCombo.SelectedItem is Data.Persistence.ExecutionDto previous &&
+            current.Id != previous.Id)
         {
-            _sizeChangesGrid.DataSource = new List<Data.Persistence.DirectoryChangeDto>();
-            return;
+            _scanNameLabel.Text = $"Changes: {current.DisplayText} vs {previous.DisplayText}";
+            await LoadChangesAsync(current.Id, previous.Id);
         }
-
-        _ = LoadChangesAsync(current.Id, previous.Id);
+        else
+        {
+            _scanNameLabel.Text = $"Top directories: {current.DisplayText}";
+            await LoadTopDirectoriesAsync(current.Id);
+        }
     }
 
     private async Task LoadChangesAsync(Guid currentId, Guid previousId)
@@ -917,6 +800,27 @@ public partial class MainForm : Form
             {
                 _sizeChangesGrid.DataSource = changes;
                 if (changes.Count > 0)
+                {
+                    _tabControl.SelectedTab = _sizeChangesTabPage;
+                }
+            });
+        }
+        catch
+        {
+            // Non-fatal; grid stays empty.
+        }
+    }
+
+    private async Task LoadTopDirectoriesAsync(Guid executionId)
+    {
+        try
+        {
+            var persistence = new ScanPersistenceService();
+            var dirs = await persistence.GetTopDirectoriesAsync(executionId, 20);
+            InvokeOnUiThread(() =>
+            {
+                _sizeChangesGrid.DataSource = dirs;
+                if (dirs.Count > 0)
                 {
                     _tabControl.SelectedTab = _sizeChangesTabPage;
                 }

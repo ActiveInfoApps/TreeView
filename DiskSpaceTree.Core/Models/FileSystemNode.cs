@@ -71,6 +71,8 @@ public sealed class FileSystemNode : INotifyPropertyChanged
 
     public FileSystemNode? Parent { get; internal set; }
 
+    public IDisplayNode? TreeNode { get; set; }
+
     public ObservableChildCollection Children { get; }
 
     /// <summary>Number of child directories that have not finished scanning yet.</summary>

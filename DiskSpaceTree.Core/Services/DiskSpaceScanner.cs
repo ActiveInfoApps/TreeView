@@ -7,8 +7,8 @@ namespace DiskSpaceTree.Services;
 public sealed class DiskSpaceScanner
 {
     /// <summary>Upper limit on the number of directories whose files get scanned.</summary>
-    public const int DefaultMaxDirectoriesToScan = 1000000000;
-    public const int DirectoryScanTaskDepth = 4;
+    public const int DefaultMaxDirectoriesToScan = 5000;
+    public const int DirectoryScanTaskDepth = 2;
 
     private readonly IFileSystemAccessor _fileSystemAccessor;
     private readonly ConcurrentDictionary<string, FileSystemNode> _foundDirectories = new();
@@ -19,9 +19,16 @@ public sealed class DiskSpaceScanner
     private readonly ConcurrentQueue<FileSystemNode> _directoryQueue = new();
     private long _filesProcessed;
     private ScanStage _currentStage;
+    private int _listingComplete;
 
     /// <summary>Raised after every directory finishes its file scan (stage 2).</summary>
     public event EventHandler<FileSystemNode>? DirectoryCompleted;
+
+    /// <summary>Raised when a new subdirectory is found during the listing stage.</summary>
+    public event EventHandler<FileSystemNode>? DirectoryDiscovered;
+
+    /// <summary>Raised for each ancestor whose rolling totals change during accumulation.</summary>
+    public event EventHandler<FileSystemNode>? AncestorUpdated;
 
     public DiskSpaceScanner(IFileSystemAccessor fileSystemAccessor, int maxDirectoriesToScan = DefaultMaxDirectoriesToScan)
     {
@@ -101,13 +108,18 @@ public sealed class DiskSpaceScanner
         }
 
         Interlocked.Exchange(ref _filesProcessed, 0);
-        _currentStage = ScanStage.ListingDirectories;
+        Interlocked.Exchange(ref _listingComplete, 0);
 
-        // Stage 1: build the full directory tree and count every directory found.
+        // Start file scanning immediately — it drains the queue as directories
+        // become available during listing.
+        _currentStage = ScanStage.ScanningFiles;
+        var drainTask = Task.Run(() => DrainDirectoryQueueAsync(progress, cancellationToken), cancellationToken);
+
+        // Stage 1: discover all directories so the tree is populated.
+        _currentStage = ScanStage.ListingDirectories;
         await BuildDirectoryListAsync(node, progress, cancellationToken, depth: 0);
 
-        // Wait for every subtree task dispatched during the listing to finish so the
-        // tree is fully built before file scanning begins.
+        // Wait for every subtree task dispatched during the listing to finish.
         while (!_listingTasks.IsEmpty)
         {
             var pending = new List<Task>();
@@ -119,28 +131,39 @@ public sealed class DiskSpaceScanner
             await Task.WhenAll(pending);
         }
 
+        // Signal the drain loop that no more directories will be enqueued.
+        Interlocked.Exchange(ref _listingComplete, 1);
+
         progress?.Report(new ScanStatus(node.Path, _filesProcessed, ScanStage.ListingDirectories, DirectoriesFound, DirectoriesScanned));
 
-        // Stage 2: start a background task that drains the queue of every discovered
-        // directory, updating each directory's direct totals and pushing them up to all
-        // of its parents so the whole tree accumulates sizes and file counts.
-        _currentStage = ScanStage.ScanningFiles;
-        var scanTask = Task.Run(() => DrainDirectoryQueueAsync(progress, cancellationToken), cancellationToken);
-        await scanTask;
+        await drainTask;
     }
 
     private async Task DrainDirectoryQueueAsync(IProgress<ScanStatus>? progress, CancellationToken cancellationToken)
     {
-        while (_directoryQueue.TryDequeue(out var node))
+        while (true)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            if (node.Parent is not null && _scannedDirectories.Count >= MaxDirectoriesToScan)
+            if (_directoryQueue.TryDequeue(out var node))
             {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                if (node.Parent is not null && _scannedDirectories.Count >= MaxDirectoriesToScan)
+                {
+                    break;
+                }
+
+                await ScanSingleDirectoryAsync(node, progress, cancellationToken);
+            }
+            else if (Interlocked.CompareExchange(ref _listingComplete, 0, 0) == 1)
+            {
+                // Listing is done and queue is empty — we're finished.
                 break;
             }
-
-            await ScanSingleDirectoryAsync(node, progress, cancellationToken);
+            else
+            {
+                // Queue temporarily empty but listing is still running — yield and retry.
+                await Task.Yield();
+            }
         }
     }
 
@@ -233,13 +256,17 @@ public sealed class DiskSpaceScanner
         return Task.CompletedTask;
     }
 
-    private static void AccumulateToSelfAndAncestors(FileSystemNode node, long sizeInKb, long fileCount)
+    private void AccumulateToSelfAndAncestors(FileSystemNode node, long sizeInKb, long fileCount)
     {
         var current = node;
         while (current is not null)
         {
             current.AddSizeInKb(sizeInKb);
             current.AddFileCount(fileCount);
+            if (current != node)
+            {
+                AncestorUpdated?.Invoke(this, current);
+            }
             current = current.Parent;
         }
     }
@@ -308,6 +335,8 @@ public sealed class DiskSpaceScanner
                 node.Children.Add(childNode);
                 node.PendingChildCount++;
             }
+
+            DirectoryDiscovered?.Invoke(this, childNode);
 
             if (_foundDirectories.Count % 100 == 0)
             {

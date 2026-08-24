@@ -232,4 +232,40 @@ public sealed class ScanPersistenceService
             .Take(count)
             .ToList();
     }
+
+    public async Task<List<DirectoryChangeDto>> GetTopDirectoriesAsync(
+        Guid executionId,
+        int count = 20,
+        CancellationToken cancellationToken = default)
+    {
+        await using var context = _contextFactory();
+        await context.Database.MigrateAsync(cancellationToken);
+
+        var infos = await context.DirectoryInfos
+            .Where(di => di.ExecutionId == executionId && !di.IsDeletedSnapshot)
+            .OrderByDescending(di => di.SizeInKb)
+            .Take(count)
+            .Select(di => new { di.DirectoryId, di.SizeInKb, di.FileCount })
+            .ToListAsync(cancellationToken);
+
+        var dirIds = infos.Select(i => i.DirectoryId).ToList();
+        var directories = await context.Directories
+            .Where(d => dirIds.Contains(d.Id))
+            .Select(d => new { d.Id, d.Path, d.Name })
+            .ToDictionaryAsync(d => d.Id, d => d, cancellationToken);
+
+        return infos
+            .Where(i => directories.ContainsKey(i.DirectoryId))
+            .Select(i => new DirectoryChangeDto
+            {
+                Path = directories[i.DirectoryId].Path,
+                Name = directories[i.DirectoryId].Name,
+                CurrentSizeInKb = i.SizeInKb,
+                CurrentFileCount = i.FileCount,
+                PreviousSizeInKb = 0,
+                PreviousFileCount = 0,
+                SizeChangeInKb = i.SizeInKb,
+            })
+            .ToList();
+    }
 }

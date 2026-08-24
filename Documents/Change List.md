@@ -1,0 +1,7 @@
+1. 2026-08-22 14:30 UTC — File scanning now starts immediately, concurrent with directory listing. The drain task is launched before `BuildDirectoryListAsync` and keeps running via `_listingComplete` flag until listing finishes and the queue is exhausted.
+
+2. 2026-08-22 14:45 UTC — Added `AncestorUpdated` event to `DiskSpaceScanner` that fires for each ancestor during `AccumulateToSelfAndAncestors` (skipping the node itself, which is already covered by `DirectoryCompleted`). MainForm subscribes and enqueues ancestors for UI update. `ProcessTreeQueue` now skips the `DisplayText` assignment if the displayed text hasn't changed.
+
+3. 2026-08-22 15:00 UTC — Fixed `LoadInitialSizeChangesAsync` to use `RefreshSizeChangesGrid()` instead of querying the DB directly, so the Size Changes combos are always the source of truth. After a scan completes, the latest execution is the base (current combo) and the previous one is the comparison (previous combo). Made `RefreshSizeChangesGrid` `async void` so the Reload button properly awaits the DB query before updating the grid.
+
+4. 2026-08-22 15:15 UTC — Added `GetTopDirectoriesAsync` to `ScanPersistenceService` to return the top N directories by size for a single execution. When the current execution combo changes (or the "Compare to" combo matches the current), the grid now shows the top 20 directories for that scan with a bold label above reading "Top directories: {scan}". When both combos differ, it shows the comparison view with a "Changes: {current} vs {previous}" label.

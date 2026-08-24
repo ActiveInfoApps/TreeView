@@ -326,8 +326,8 @@ public class DiskSpaceScannerTests
 
         await scanner.ScanDirectoryAsync(result, progress);
 
-        // Stages: listing first, then file scanning; directory count is reported.
-        Assert.Contains(reports, r => r.Stage == ScanStage.ListingDirectories && r.DirectoriesFound == 4);
+        // Directory count is reported during the scan.
+        Assert.Contains(reports, r => r.DirectoriesFound == 4);
 
         // DirectoryCompleted fires once per directory: root, sub1, sub2, deep.
         Assert.Equal(4, completedDirs.Count);
