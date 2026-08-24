@@ -664,9 +664,17 @@ public partial class MainForm : Form
 
     private void OpenInExplorer_Click(object? sender, EventArgs e)
     {
-        if (_treeView.SelectedNode?.Tag is FileSystemNode node)
+        if (_treeView.SelectedNode is DisplayTreeNode displayNode &&
+            !string.IsNullOrEmpty(displayNode.ToolTipText))
         {
-            OpenInExplorer(node);
+            try
+            {
+                Process.Start(new ProcessStartInfo("explorer.exe", $"\"{displayNode.ToolTipText}\"") { UseShellExecute = true });
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Failed to open Explorer: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
     }
 
