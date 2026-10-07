@@ -7,7 +7,7 @@ namespace DiskSpaceTree.Services;
 public sealed class DiskSpaceScanner
 {
     /// <summary>Upper limit on the number of directories whose files get scanned.</summary>
-    public const int DefaultMaxDirectoriesToScan = 5000;
+    public const int DefaultMaxDirectoriesToScan = 500000000;
     public const int DirectoryScanTaskDepth = 2;
 
     private readonly IFileSystemAccessor _fileSystemAccessor;
